@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: trioclash-multiplayer-server
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
