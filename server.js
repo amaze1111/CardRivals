@@ -1,8 +1,24 @@
+import http from "node:http";
+import crypto from "node:crypto";
 import { WebSocketServer } from "ws";
+import pg from "pg";
+import bcrypt from "bcryptjs";
+
+const { Pool } = pg;
 
 const PORT = Number(process.env.PORT || 8080);
-const wss = new WebSocketServer({ port: PORT });
+const DATABASE_URL = process.env.DATABASE_URL;
 
+if (!DATABASE_URL) {
+  console.warn("DATABASE_URL is not set. Auth endpoints will fail until it is configured.");
+}
+
+const db = new Pool({
+  connectionString: DATABASE_URL,
+  ssl: DATABASE_URL ? { rejectUnauthorized: false } : false
+});
+
+const sessions = new Map();
 const rooms = new Map();
 const clientMeta = new Map();
 
@@ -11,6 +27,167 @@ const RANKS = [
   ["A", 14], ["2", 2], ["3", 3], ["4", 4], ["5", 5], ["6", 6], ["7", 7],
   ["8", 8], ["9", 9], ["10", 10], ["J", 11], ["Q", 12], ["K", 13]
 ];
+
+async function ensureSchema() {
+  if (!DATABASE_URL) return;
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS users (
+      id SERIAL PRIMARY KEY,
+      display_name TEXT NOT NULL,
+      email TEXT NOT NULL UNIQUE,
+      password_hash TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+}
+
+function json(res, statusCode, payload) {
+  res.writeHead(statusCode, {
+    "Content-Type": "application/json",
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type,Authorization"
+  });
+  res.end(JSON.stringify(payload));
+}
+
+function parseBody(req) {
+  return new Promise((resolve, reject) => {
+    let body = "";
+    req.on("data", (chunk) => {
+      body += chunk;
+    });
+    req.on("end", () => {
+      if (!body) {
+        resolve({});
+        return;
+      }
+      try {
+        resolve(JSON.parse(body));
+      } catch (error) {
+        reject(error);
+      }
+    });
+    req.on("error", reject);
+  });
+}
+
+function issueSession(user) {
+  const token = crypto.randomBytes(24).toString("hex");
+  sessions.set(token, {
+    userId: user.id,
+    displayName: user.display_name,
+    email: user.email
+  });
+  return token;
+}
+
+async function handleSignup(req, res) {
+  if (!DATABASE_URL) {
+    json(res, 500, { error: "DATABASE_URL is not configured on the server." });
+    return;
+  }
+
+  const { displayName = "", email = "", password = "" } = await parseBody(req);
+  const normalizedEmail = String(email).trim().toLowerCase();
+  const normalizedName = String(displayName).trim();
+
+  if (!normalizedName || !normalizedEmail || String(password).length < 6) {
+    json(res, 400, { error: "Display name, email, and a 6+ character password are required." });
+    return;
+  }
+
+  const existing = await db.query("SELECT id FROM users WHERE email = $1", [normalizedEmail]);
+  if (existing.rowCount) {
+    json(res, 409, { error: "An account already exists for that email." });
+    return;
+  }
+
+  const passwordHash = await bcrypt.hash(String(password), 10);
+  const result = await db.query(
+    `INSERT INTO users (display_name, email, password_hash)
+     VALUES ($1, $2, $3)
+     RETURNING id, display_name, email`,
+    [normalizedName, normalizedEmail, passwordHash]
+  );
+
+  const user = result.rows[0];
+  const token = issueSession(user);
+  json(res, 201, {
+    token,
+    user: {
+      id: user.id,
+      displayName: user.display_name,
+      email: user.email
+    }
+  });
+}
+
+async function handleLogin(req, res) {
+  if (!DATABASE_URL) {
+    json(res, 500, { error: "DATABASE_URL is not configured on the server." });
+    return;
+  }
+
+  const { email = "", password = "" } = await parseBody(req);
+  const normalizedEmail = String(email).trim().toLowerCase();
+  const result = await db.query(
+    "SELECT id, display_name, email, password_hash FROM users WHERE email = $1",
+    [normalizedEmail]
+  );
+
+  if (!result.rowCount) {
+    json(res, 401, { error: "Invalid email or password." });
+    return;
+  }
+
+  const user = result.rows[0];
+  const validPassword = await bcrypt.compare(String(password), user.password_hash);
+  if (!validPassword) {
+    json(res, 401, { error: "Invalid email or password." });
+    return;
+  }
+
+  const token = issueSession(user);
+  json(res, 200, {
+    token,
+    user: {
+      id: user.id,
+      displayName: user.display_name,
+      email: user.email
+    }
+  });
+}
+
+const server = http.createServer(async (req, res) => {
+  try {
+    if (req.method === "OPTIONS") {
+      json(res, 204, {});
+      return;
+    }
+
+    if (req.method === "GET" && req.url === "/health") {
+      json(res, 200, { ok: true });
+      return;
+    }
+
+    if (req.method === "POST" && req.url === "/auth/signup") {
+      await handleSignup(req, res);
+      return;
+    }
+
+    if (req.method === "POST" && req.url === "/auth/login") {
+      await handleLogin(req, res);
+      return;
+    }
+
+    json(res, 404, { error: "Not found." });
+  } catch (error) {
+    json(res, 500, { error: error instanceof Error ? error.message : "Unexpected server error." });
+  }
+});
+
+const wss = new WebSocketServer({ server });
 
 function id() {
   return Math.random().toString(36).slice(2, 8).toUpperCase();
@@ -338,4 +515,13 @@ wss.on("connection", (socket) => {
   });
 });
 
-console.log(`Trio Clash multiplayer server running on :${PORT}`);
+ensureSchema()
+  .then(() => {
+    server.listen(PORT, () => {
+      console.log(`Trio Clash auth and multiplayer server running on :${PORT}`);
+    });
+  })
+  .catch((error) => {
+    console.error("Failed to initialize database schema.", error);
+    process.exit(1);
+  });
