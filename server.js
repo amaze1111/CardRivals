@@ -39,6 +39,38 @@ async function ensureSchema() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
   `);
+
+  const columnsResult = await db.query(
+    `SELECT column_name
+     FROM information_schema.columns
+     WHERE table_schema = 'public' AND table_name = 'users'`
+  );
+  const columns = new Set(columnsResult.rows.map((row) => row.column_name));
+
+  if (!columns.has("display_name")) {
+    if (columns.has("displayname")) {
+      await db.query(`ALTER TABLE users RENAME COLUMN displayname TO display_name`);
+    } else {
+      await db.query(`ALTER TABLE users ADD COLUMN display_name TEXT`);
+      await db.query(`UPDATE users SET display_name = COALESCE(email, 'Player') WHERE display_name IS NULL`);
+      await db.query(`ALTER TABLE users ALTER COLUMN display_name SET NOT NULL`);
+    }
+  }
+
+  if (!columns.has("password_hash")) {
+    if (columns.has("passwordhash")) {
+      await db.query(`ALTER TABLE users RENAME COLUMN passwordhash TO password_hash`);
+    } else if (columns.has("password")) {
+      await db.query(`ALTER TABLE users RENAME COLUMN password TO password_hash`);
+    }
+  }
+
+  await db.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`);
+  await db.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS email TEXT`);
+  await db.query(`ALTER TABLE users ALTER COLUMN email SET NOT NULL`);
+  await db.query(`ALTER TABLE users ALTER COLUMN display_name SET NOT NULL`);
+  await db.query(`ALTER TABLE users ALTER COLUMN password_hash SET NOT NULL`);
+  await db.query(`CREATE UNIQUE INDEX IF NOT EXISTS users_email_key ON users(email)`);
 }
 
 function json(res, statusCode, payload) {
