@@ -20,11 +20,11 @@ The server listens on `PORT` or `8080`.
 ## Render
 
 - Create a new Web Service
-- Root directory: repository root
+- Root directory: `multiplayer-server`
 - Build command: `npm install`
 - Start command: `npm start`
-
-You can also use the included `render.yaml`.
+- Set `DATABASE_URL`
+- Set `FIREBASE_SERVICE_ACCOUNT_JSON`
 
 ## Protocol summary
 
@@ -46,3 +46,23 @@ Server -> client:
 - `error`
 
 Each `state` payload is sanitized per player so only that player sees their own hand.
+
+## HTTP API added
+
+- `POST /auth/firebase`
+- `POST /auth/logout`
+- `GET /me`
+- `GET /wallet`
+- `POST /events`
+- `POST /matchmaking/join`
+- `POST /economy/claim-daily`
+- `POST /economy/settle-match`
+- `GET /quests`
+- `POST /quests/claim`
+
+The server now also stores:
+
+- app sessions
+- analytics events
+- economy transactions
+- quest progress
