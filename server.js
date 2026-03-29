@@ -160,6 +160,14 @@ async function ensureSchema() {
     WHERE table_schema = 'public' AND table_name = 'users'
   `);
   const columns = new Set(columnsResult.rows.map((row) => row.column_name));
+  const idTypeResult = await db.query(`
+    SELECT data_type, udt_name
+    FROM information_schema.columns
+    WHERE table_schema = 'public' AND table_name = 'users' AND column_name = 'id'
+  `);
+  const userIdColumnType = idTypeResult.rowCount
+    ? (idTypeResult.rows[0].udt_name === "uuid" ? "UUID" : "INTEGER")
+    : "INTEGER";
   if (!columns.has("display_name")) {
     if (columns.has("displayname")) {
       await db.query(`ALTER TABLE users RENAME COLUMN displayname TO display_name`);
@@ -188,7 +196,7 @@ async function ensureSchema() {
   await db.query(`
     CREATE TABLE IF NOT EXISTS sessions (
       token TEXT PRIMARY KEY,
-      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      user_id ${userIdColumnType} NOT NULL REFERENCES users(id) ON DELETE CASCADE,
       issued_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       expires_at TIMESTAMPTZ,
       revoked_at TIMESTAMPTZ
@@ -198,7 +206,7 @@ async function ensureSchema() {
   await db.query(`
     CREATE TABLE IF NOT EXISTS analytics_events (
       id BIGSERIAL PRIMARY KEY,
-      user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+      user_id ${userIdColumnType} REFERENCES users(id) ON DELETE SET NULL,
       event_name TEXT NOT NULL,
       source TEXT NOT NULL,
       match_id TEXT,
@@ -210,7 +218,7 @@ async function ensureSchema() {
   await db.query(`
     CREATE TABLE IF NOT EXISTS economy_transactions (
       id BIGSERIAL PRIMARY KEY,
-      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      user_id ${userIdColumnType} NOT NULL REFERENCES users(id) ON DELETE CASCADE,
       transaction_type TEXT NOT NULL,
       amount INTEGER NOT NULL,
       balance_after INTEGER NOT NULL,
@@ -227,7 +235,7 @@ async function ensureSchema() {
 
   await db.query(`
     CREATE TABLE IF NOT EXISTS user_quests (
-      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      user_id ${userIdColumnType} NOT NULL REFERENCES users(id) ON DELETE CASCADE,
       quest_key TEXT NOT NULL,
       progress INTEGER NOT NULL DEFAULT 0,
       completed_at TIMESTAMPTZ,
