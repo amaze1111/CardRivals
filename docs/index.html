@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TrioClash Legal</title>
+  <style>
+    :root {
+      --bg: #091a14;
+      --panel: #123227;
+      --panel-2: #174334;
+      --text: #f4f0df;
+      --muted: #c5d6c9;
+      --gold: #e3bb58;
+      --line: #3d705c;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: Arial, sans-serif;
+      background: radial-gradient(circle at top, #1f5a46 0%, var(--bg) 55%);
+      color: var(--text);
+      min-height: 100vh;
+    }
+    .wrap {
+      max-width: 880px;
+      margin: 0 auto;
+      padding: 48px 20px 64px;
+    }
+    .hero {
+      background: linear-gradient(135deg, rgba(227, 187, 88, 0.16), rgba(18, 50, 39, 0.95));
+      border: 1px solid var(--line);
+      border-radius: 28px;
+      padding: 32px;
+      box-shadow: 0 24px 60px rgba(0, 0, 0, 0.28);
+    }
+    h1 {
+      margin: 0 0 8px;
+      color: var(--gold);
+      font-size: 42px;
+    }
+    p {
+      color: var(--muted);
+      line-height: 1.65;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 18px;
+      margin-top: 24px;
+    }
+    a.card {
+      display: block;
+      text-decoration: none;
+      color: inherit;
+      background: linear-gradient(180deg, var(--panel-2), var(--panel));
+      border: 1px solid var(--line);
+      border-radius: 22px;
+      padding: 22px;
+      box-shadow: 0 14px 30px rgba(0, 0, 0, 0.2);
+    }
+    a.card h2 {
+      margin: 0 0 10px;
+      color: var(--gold);
+      font-size: 22px;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <section class="hero">
+      <h1>TrioClash</h1>
+      <p>Legal and support pages for TrioClash.</p>
+      <div class="grid">
+        <a class="card" href="./privacy-policy.html">
+          <h2>Privacy Policy</h2>
+          <p>How TrioClash collects, uses, stores, and protects user data.</p>
+        </a>
+        <a class="card" href="./user-data-deletion.html">
+          <h2>User Data Deletion</h2>
+          <p>How a player can request deletion of account data and related records.</p>
+        </a>
+      </div>
+    </section>
+  </div>
+</body>
+</html>
