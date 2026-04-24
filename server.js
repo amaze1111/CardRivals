@@ -5,7 +5,10 @@ import pg from "pg";
 import bcrypt from "bcryptjs";
 import { initializeApp, cert, getApps } from "firebase-admin/app";
 import { getAuth } from "firebase-admin/auth";
-
+import { createMatchmakingManager } from "./backend_matchmaking.js";
+const matchmaking = createMatchmakingManager({
+  waitMs: Number(process.env.MATCHMAKING_WAIT_MS || 5000),
+});
 const { Pool } = pg;
 
 const PORT = Number(process.env.PORT || 8080);
@@ -692,15 +695,17 @@ async function handleMatchmakingJoin(req, res) {
       matchId,
       payload: { playerCount, entryFee, rewardPool, coinBalance: updatedCoins },
     });
-    json(res, 200, {
-      matchId,
-      playerCount,
-      entryFee,
-      rewardPool,
-      coinBalance: updatedCoins,
-      isRanked: true,
-      botFillApplied: false,
-    });
+    matchmaking.join({
+  req,
+  res,
+  userId: session.userId,
+  playerCount,
+  entryFee,
+  rewardPool,
+  coinBalance: updatedCoins,
+  isRanked: true,
+});
+return;
   } catch (error) {
     await client.query("ROLLBACK");
     fail(res, 500, error instanceof Error ? error.message : "Could not join matchmaking.");
