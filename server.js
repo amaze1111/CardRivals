@@ -17,7 +17,7 @@ const FIREBASE_SERVICE_ACCOUNT_JSON = process.env.FIREBASE_SERVICE_ACCOUNT_JSON 
 const STARTING_COINS = Number(process.env.STARTING_COINS || 500);
 const DAILY_COIN_REWARD = Number(process.env.DAILY_COIN_REWARD || 75);
 const MATCH_ENTRY_FEES = {
-  2: Number(process.env.MATCH_ENTRY_FEE_2P || 20),
+  2: Number(process.env.MATCH_ENTRY_FEE_2P || 1),
   4: Number(process.env.MATCH_ENTRY_FEE_4P || 40),
 };
 
