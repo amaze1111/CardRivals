@@ -394,6 +394,12 @@ async function issueAppSession(user) {
     source: "server",
     payload: { provider: user.auth_provider || "email" },
   });
+  await writeAnalyticsEvent({
+    userId: user.id,
+    eventName: "app_open",
+    source: "server",
+    payload: { provider: user.auth_provider || "email" },
+  });
   return token;
 }
 
