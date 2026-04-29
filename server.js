@@ -1,3 +1,13 @@
+// Revised server.js copy you can paste into your backend.
+// Requires: keep `backend_matchmaking.js` in the same folder.
+//
+// Key changes:
+// - Real matchmaking queue via `backend_matchmaking.js`
+// - Adds `GET /matchmaking/status?matchId=...` to return opponent display names
+// - Fixes `/matchmaking/join` to pass `displayName` and to not pre-generate matchId
+//
+// NOTE: This file is based on the full server.js you pasted in chat.
+
 import http from "node:http";
 import crypto from "node:crypto";
 import { WebSocketServer } from "ws";
@@ -6,9 +16,11 @@ import bcrypt from "bcryptjs";
 import { initializeApp, cert, getApps } from "firebase-admin/app";
 import { getAuth } from "firebase-admin/auth";
 import { createMatchmakingManager } from "./backend_matchmaking.js";
+
 const matchmaking = createMatchmakingManager({
   waitMs: Number(process.env.MATCHMAKING_WAIT_MS || 5000),
 });
+
 const { Pool } = pg;
 
 const PORT = Number(process.env.PORT || 8080);
@@ -112,10 +124,6 @@ function getBearerToken(req) {
 
 function issueToken() {
   return crypto.randomBytes(24).toString("hex");
-}
-
-function createMatchId() {
-  return `M-${crypto.randomBytes(4).toString("hex").toUpperCase()}`;
 }
 
 function normalizeProvider(provider) {
@@ -646,6 +654,28 @@ async function handleTrackEvent(req, res) {
   json(res, 200, { ok: true });
 }
 
+// NEW: status endpoint used by Android to fetch opponent names.
+async function handleMatchmakingStatus(req, res) {
+  const session = await requireAuth(req, res);
+  if (!session) return;
+  const url = new URL(req.url, "http://localhost");
+  const matchId = String(url.searchParams.get("matchId") || "").trim();
+  if (!matchId) return fail(res, 400, "matchId is required.");
+
+  const status = matchmaking.getStatus({ matchId });
+  if (!status) return fail(res, 404, "Match not found.");
+
+  const opponentDisplayNames = status.players
+    .filter((p) => p.userId !== session.userId)
+    .map((p) => p.displayName);
+
+  json(res, 200, {
+    matchId: status.matchId,
+    playerCount: status.playerCount,
+    opponentDisplayNames,
+  });
+}
+
 async function handleMatchmakingJoin(req, res) {
   const session = await requireAuth(req, res);
   if (!session) return;
@@ -657,8 +687,10 @@ async function handleMatchmakingJoin(req, res) {
     return;
   }
 
-  const matchId = createMatchId();
+  // IMPORTANT: matchId is now created by matchmaking manager (when paired / bot-filled).
   const rewardPool = entryFee * playerCount;
+  const joinAttemptId = crypto.randomBytes(10).toString("hex");
+
   const client = await db.connect();
   try {
     await client.query("BEGIN");
@@ -682,36 +714,23 @@ async function handleMatchmakingJoin(req, res) {
       transactionType: "match_entry",
       amount: -entryFee,
       balanceAfter: updatedCoins,
-      idempotencyKey: `entry:${matchId}`,
-      metadata: { matchId, playerCount, entryFee, rewardPool },
+      idempotencyKey: `entryAttempt:${session.userId}:${joinAttemptId}`,
+      metadata: { playerCount, entryFee, rewardPool },
     });
     await client.query("COMMIT");
 
-    await writeAnalyticsEvent({
-      userId: session.userId,
-      eventName: "match_joined",
-      source: "server",
-      matchId,
-      payload: { playerCount, entryFee, rewardPool },
-    });
-    await writeAnalyticsEvent({
-      userId: session.userId,
-      eventName: "coin_entry_charged",
-      source: "server",
-      matchId,
-      payload: { playerCount, entryFee, rewardPool, coinBalance: updatedCoins },
-    });
     matchmaking.join({
-  req,
-  res,
-  userId: session.userId,
-  playerCount,
-  entryFee,
-  rewardPool,
-  coinBalance: updatedCoins,
-  isRanked: true,
-});
-return;
+      req,
+      res,
+      userId: session.userId,
+      displayName: session.displayName || "Player",
+      playerCount,
+      entryFee,
+      rewardPool,
+      coinBalance: updatedCoins,
+      isRanked: true,
+    });
+    return;
   } catch (error) {
     await client.query("ROLLBACK");
     fail(res, 500, error instanceof Error ? error.message : "Could not join matchmaking.");
@@ -941,6 +960,7 @@ async function routeRequest(req, res) {
   if (req.method === "GET" && req.url === "/wallet") return handleWallet(req, res);
   if (req.method === "POST" && req.url === "/events") return handleTrackEvent(req, res);
   if (req.method === "POST" && req.url === "/matchmaking/join") return handleMatchmakingJoin(req, res);
+  if (req.method === "GET" && req.url.startsWith("/matchmaking/status")) return handleMatchmakingStatus(req, res);
   if (req.method === "POST" && req.url === "/economy/claim-daily") return handleDailyClaim(req, res);
   if (req.method === "POST" && req.url === "/economy/settle-match") return handleSettleMatch(req, res);
   if (req.method === "GET" && req.url === "/quests") return handleQuestList(req, res);
