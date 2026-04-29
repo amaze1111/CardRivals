@@ -19,6 +19,7 @@ export function createMatchmakingManager({
   onRespond,
 } = {}) {
   const queues = new Map(); // playerCount -> Pending[]
+  const matches = new Map(); // matchId -> { playerCount, players: [{ userId, displayName }], createdAtMs }
 
   function queueFor(playerCount) {
     const key = String(playerCount);
@@ -60,11 +61,26 @@ export function createMatchmakingManager({
     return queue.splice(0, playerCount - 1);
   }
 
+  function upsertMatch(matchId, playerCount, players) {
+    matches.set(matchId, {
+      matchId,
+      playerCount,
+      players,
+      createdAtMs: Date.now(),
+    });
+  }
+
   return {
+    getStatus({ matchId }) {
+      if (!matchId) return null;
+      return matches.get(String(matchId).trim()) || null;
+    },
+
     join({
       req,
       res,
       userId,
+      displayName = "Player",
       playerCount,
       entryFee,
       rewardPool,
@@ -84,6 +100,11 @@ export function createMatchmakingManager({
       const match = tryMatch(queue, playerCount);
       if (match) {
         const matchId = createMatchId();
+        const matchPlayers = [
+          { userId, displayName },
+          ...match.map((pending) => ({ userId: pending.userId, displayName: pending.displayName })),
+        ];
+        upsertMatch(matchId, playerCount, matchPlayers);
         respondGroup(
           match,
           (pending) => ({
@@ -94,6 +115,9 @@ export function createMatchmakingManager({
             coinBalance: pending.coinBalance,
             isRanked,
             botFillApplied: false,
+            opponentDisplayNames: matchPlayers
+              .filter((p) => p.userId !== pending.userId)
+              .map((p) => p.displayName),
           }),
         );
         const payload = {
@@ -104,6 +128,9 @@ export function createMatchmakingManager({
           coinBalance,
           isRanked,
           botFillApplied: false,
+          opponentDisplayNames: matchPlayers
+            .filter((p) => p.userId !== userId)
+            .map((p) => p.displayName),
         };
         try {
           onRespond?.({ userId, payload });
@@ -122,6 +149,7 @@ export function createMatchmakingManager({
 
       const pending = {
         userId,
+        displayName,
         coinBalance,
         respond,
         timeoutId: null,
@@ -129,14 +157,17 @@ export function createMatchmakingManager({
 
       pending.timeoutId = setTimeout(() => {
         remove(queue, pending);
+        const matchId = createMatchId();
+        upsertMatch(matchId, playerCount, [{ userId, displayName }]);
         const payload = {
-          matchId: createMatchId(),
+          matchId,
           playerCount,
           entryFee,
           rewardPool,
           coinBalance,
           isRanked,
           botFillApplied: true,
+          opponentDisplayNames: [],
         };
         try {
           onRespond?.({ userId, payload });
