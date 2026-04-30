@@ -17,10 +17,6 @@ import { initializeApp, cert, getApps } from "firebase-admin/app";
 import { getAuth } from "firebase-admin/auth";
 import { createMatchmakingManager } from "./backend_matchmaking.js";
 
-const matchmaking = createMatchmakingManager({
-  waitMs: Number(process.env.MATCHMAKING_WAIT_MS || 5000),
-});
-
 const { Pool } = pg;
 
 const PORT = Number(process.env.PORT || 8080);
@@ -57,6 +53,98 @@ const db = new Pool({
 const sessions = new Map();
 const rooms = new Map();
 const clientMeta = new Map();
+const matchmakingSockets = new Map(); // userId -> WebSocket
+
+function connectedCount(roomId) {
+  let count = 0;
+  clientMeta.forEach((meta, socket) => {
+    if (socket.readyState !== 1) return;
+    if (meta.roomId !== roomId) return;
+    count += 1;
+  });
+  return count;
+}
+
+function ensureMatchRoom(matchId) {
+  const normalized = String(matchId || "").trim().toUpperCase();
+  if (!normalized) return null;
+  const existing = rooms.get(normalized);
+  if (existing) return existing;
+  const status = matchmaking.getStatus({ matchId: normalized });
+  if (!status) return null;
+  const room = {
+    id: normalized,
+    phase: "lobby",
+    round: 1,
+    totalRounds: 3,
+    activeArrangePlayerIndex: 0,
+    battleGroupIndex: 0,
+    battleRevealCount: 0,
+    scores: status.players.map(() => 0),
+    groupsWon: status.players.map(() => 0),
+    players: status.players.map((p, index) => createPlayer(p.displayName || `Player ${index + 1}`, index)),
+  };
+  rooms.set(normalized, room);
+  return room;
+}
+
+function attachSocketToMatchRoom({ socket, matchId, userId }) {
+  const status = matchmaking.getStatus({ matchId });
+  if (!status) {
+    socketFail(socket, "Match not found.");
+    return;
+  }
+  const playerIndex = status.players.findIndex((p) => p.userId === userId);
+  if (playerIndex < 0) {
+    socketFail(socket, "Not a participant in this match.");
+    return;
+  }
+  const room = ensureMatchRoom(matchId);
+  if (!room) {
+    socketFail(socket, "Room not found.");
+    return;
+  }
+  clientMeta.set(socket, { roomId: room.id, playerIndex });
+  send(socket, "match_joined", { roomId: room.id, playerIndex, matchId: room.id });
+  broadcastRoom(room);
+
+  // Auto-start once all players are connected.
+  if (room.phase === "lobby" && connectedCount(room.id) >= status.players.length) {
+    room.scores = room.players.map(() => 0);
+    room.groupsWon = room.players.map(() => 0);
+    room.round = 1;
+    dealRound(room);
+    broadcastRoom(room);
+  }
+}
+
+const matchmaking = createMatchmakingManager({
+  waitMs: Number(process.env.MATCHMAKING_WAIT_MS || 5000),
+  onRespond: ({ userId, payload }) => {
+    if (!payload || !payload.matchId) return;
+    if (payload.botFillApplied) return;
+    const matchId = String(payload.matchId).trim().toUpperCase();
+    const status = matchmaking.getStatus({ matchId });
+    if (!status) return;
+
+    // Ensure room exists and auto-attach any listening sockets.
+    ensureMatchRoom(matchId);
+    for (const player of status.players) {
+      const socket = matchmakingSockets.get(player.userId);
+      if (!socket || socket.readyState !== 1) continue;
+      attachSocketToMatchRoom({ socket, matchId, userId: player.userId });
+    }
+
+    // Optional: analytics for match assignment.
+    writeAnalyticsEvent({
+      userId,
+      eventName: "match_assigned",
+      source: "server",
+      matchId,
+      payload: { playerCount: payload.playerCount },
+    }).catch(() => {});
+  },
+});
 
 const firebaseAuth = initializeFirebaseAdmin();
 
@@ -1159,15 +1247,37 @@ function requirePlayer(socket, room) {
 
 wss.on("connection", (socket) => {
   socket.on("message", (raw) => {
-    let message;
-    try {
-      message = JSON.parse(String(raw));
-    } catch {
-      socketFail(socket, "Invalid JSON.");
-      return;
-    }
+    void (async () => {
+      let message;
+      try {
+        message = JSON.parse(String(raw));
+      } catch {
+        socketFail(socket, "Invalid JSON.");
+        return;
+      }
 
-    const { type, payload = {} } = message;
+      const { type, payload = {} } = message;
+
+      if (type === "matchmaking_listen") {
+        const token = String(payload.authToken || payload.token || "").trim();
+        if (!token) return socketFail(socket, "Missing auth token.");
+        const session = await fetchUserByToken(token);
+        if (!session) return socketFail(socket, "Invalid or expired auth token.");
+        matchmakingSockets.set(session.userId, socket);
+        send(socket, "matchmaking_listening", { ok: true });
+        return;
+      }
+
+      if (type === "join_match") {
+        const matchId = String(payload.matchId || "").trim().toUpperCase();
+        const token = String(payload.authToken || payload.token || "").trim();
+        if (!matchId) return socketFail(socket, "Missing matchId.");
+        if (!token) return socketFail(socket, "Missing auth token.");
+        const session = await fetchUserByToken(token);
+        if (!session) return socketFail(socket, "Invalid or expired auth token.");
+        attachSocketToMatchRoom({ socket, matchId, userId: session.userId });
+        return;
+      }
 
     if (type === "create_room") {
       const room = createRoom(payload.name || "Host");
@@ -1282,9 +1392,17 @@ wss.on("connection", (socket) => {
 
       broadcastRoom(room);
     }
+    })().catch((error) => {
+      socketFail(socket, error instanceof Error ? error.message : "Unexpected server error.");
+    });
   });
 
   socket.on("close", () => {
+    // If this socket was registered for matchmaking, remove it.
+    matchmakingSockets.forEach((value, key) => {
+      if (value === socket) matchmakingSockets.delete(key);
+    });
+
     const meta = clientMeta.get(socket);
     clientMeta.delete(socket);
     if (!meta) return;
