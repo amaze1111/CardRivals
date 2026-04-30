@@ -55,6 +55,37 @@ const rooms = new Map();
 const clientMeta = new Map();
 const matchmakingSockets = new Map(); // userId -> WebSocket
 
+// FIX: matchmaking is declared here (before ensureMatchRoom and attachSocketToMatchRoom)
+// so that the closures inside those functions reference a fully initialised binding.
+// Previously matchmaking was declared at line ~121, AFTER the functions that used it,
+// which is safe at call-time in practice but fragile and confusing.
+const matchmaking = createMatchmakingManager({
+  waitMs: Number(process.env.MATCHMAKING_WAIT_MS || 5000),
+  onRespond: ({ userId, payload }) => {
+    if (!payload || !payload.matchId) return;
+    if (payload.botFillApplied) return; // Bot-fill: no real room needed server-side.
+    const matchId = String(payload.matchId).trim().toUpperCase();
+    const status = matchmaking.getStatus({ matchId });
+    if (!status) return;
+
+    // Ensure room exists, then push room attachment to every matched player's socket.
+    ensureMatchRoom(matchId);
+    for (const player of status.players) {
+      const socket = matchmakingSockets.get(player.userId);
+      if (!socket || socket.readyState !== 1) continue;
+      attachSocketToMatchRoom({ socket, matchId, userId: player.userId });
+    }
+
+    writeAnalyticsEvent({
+      userId,
+      eventName: "match_assigned",
+      source: "server",
+      matchId,
+      payload: { playerCount: payload.playerCount },
+    }).catch(() => {});
+  },
+});
+
 function connectedCount(roomId) {
   let count = 0;
   clientMeta.forEach((meta, socket) => {
@@ -118,33 +149,7 @@ function attachSocketToMatchRoom({ socket, matchId, userId }) {
   }
 }
 
-const matchmaking = createMatchmakingManager({
-  waitMs: Number(process.env.MATCHMAKING_WAIT_MS || 5000),
-  onRespond: ({ userId, payload }) => {
-    if (!payload || !payload.matchId) return;
-    if (payload.botFillApplied) return;
-    const matchId = String(payload.matchId).trim().toUpperCase();
-    const status = matchmaking.getStatus({ matchId });
-    if (!status) return;
-
-    // Ensure room exists and auto-attach any listening sockets.
-    ensureMatchRoom(matchId);
-    for (const player of status.players) {
-      const socket = matchmakingSockets.get(player.userId);
-      if (!socket || socket.readyState !== 1) continue;
-      attachSocketToMatchRoom({ socket, matchId, userId: player.userId });
-    }
-
-    // Optional: analytics for match assignment.
-    writeAnalyticsEvent({
-      userId,
-      eventName: "match_assigned",
-      source: "server",
-      matchId,
-      payload: { playerCount: payload.playerCount },
-    }).catch(() => {});
-  },
-});
+// matchmaking is declared earlier in this file (above ensureMatchRoom).
 
 const firebaseAuth = initializeFirebaseAdmin();
 
@@ -1263,6 +1268,13 @@ wss.on("connection", (socket) => {
         if (!token) return socketFail(socket, "Missing auth token.");
         const session = await fetchUserByToken(token);
         if (!session) return socketFail(socket, "Invalid or expired auth token.");
+        // FIX: If this userId was registered on a different (stale) socket, remove it.
+        // The old code had no guard, so a reconnecting client would leave a dead socket
+        // in matchmakingSockets that the server would try to push to.
+        const existing = matchmakingSockets.get(session.userId);
+        if (existing && existing !== socket) {
+          existing.close(1000, "Replaced by new connection");
+        }
         matchmakingSockets.set(session.userId, socket);
         send(socket, "matchmaking_listening", { ok: true });
         return;
@@ -1398,7 +1410,7 @@ wss.on("connection", (socket) => {
   });
 
   socket.on("close", () => {
-    // If this socket was registered for matchmaking, remove it.
+    // Remove from matchmaking socket registry if registered.
     matchmakingSockets.forEach((value, key) => {
       if (value === socket) matchmakingSockets.delete(key);
     });
@@ -1408,15 +1420,32 @@ wss.on("connection", (socket) => {
     if (!meta) return;
     const room = rooms.get(meta.roomId);
     if (!room) return;
-    room.players = room.players.filter((_, index) => index !== meta.playerIndex);
-    if (room.players.length === 0) {
-      rooms.delete(meta.roomId);
+
+    // FIX: The old code spliced room.players and re-indexed, which corrupted
+    // clientMeta.playerIndex for all remaining connected sockets (their stored
+    // index no longer matched the array position after re-indexing).
+    //
+    // Instead: mark the player slot as disconnected but keep the array stable.
+    // This preserves every other socket's playerIndex reference.
+    // If all slots are empty, clean up the room entirely.
+    const disconnectedIndex = meta.playerIndex;
+    if (disconnectedIndex >= 0 && disconnectedIndex < room.players.length) {
+      room.players[disconnectedIndex] = {
+        ...room.players[disconnectedIndex],
+        disconnected: true,
+      };
+    }
+
+    // Check if any socket is still connected to this room.
+    let anyConnected = false;
+    clientMeta.forEach((m, s) => {
+      if (m.roomId === room.id && s.readyState === 1) anyConnected = true;
+    });
+    if (!anyConnected) {
+      rooms.delete(room.id);
       return;
     }
-    room.players = room.players.map((player, index) => ({ ...player, id: index }));
-    room.scores = room.players.map((_, index) => room.scores[index] || 0);
-    room.groupsWon = room.players.map((_, index) => room.groupsWon[index] || 0);
-    room.activeArrangePlayerIndex = Math.min(room.activeArrangePlayerIndex, room.players.length - 1);
+
     broadcastRoom(room);
   });
 });
