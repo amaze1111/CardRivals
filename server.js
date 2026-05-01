@@ -80,6 +80,7 @@ function ensureMatchRoom(matchId) {
     activeArrangePlayerIndex: 0,
     battleGroupIndex: 0,
     battleRevealCount: 0,
+    battleWinnerIndex: null,
     scores: status.players.map(() => 0),
     groupsWon: status.players.map(() => 0),
     players: status.players.map((p, index) => createPlayer(p.displayName || `Player ${index + 1}`, index)),
@@ -1106,6 +1107,7 @@ function createRoom(hostName) {
     activeArrangePlayerIndex: 0,
     battleGroupIndex: 0,
     battleRevealCount: 0,
+    battleWinnerIndex: null,
     scores: [0],
     groupsWon: [0],
     players: [createPlayer(hostName, 0)],
@@ -1128,6 +1130,7 @@ function dealRound(room) {
   room.activeArrangePlayerIndex = 0;
   room.battleGroupIndex = 0;
   room.battleRevealCount = 0;
+  room.battleWinnerIndex = null;
 }
 
 function evaluateGroup(cards) {
@@ -1195,6 +1198,9 @@ function sanitizeRoomState(room, playerIndex) {
     activeArrangePlayerIndex: room.activeArrangePlayerIndex,
     battleGroupIndex: room.battleGroupIndex,
     battleRevealCount: room.battleRevealCount,
+    // Send the winner of the current group once all cards are revealed,
+    // so the client can highlight the winner and enable scoring.
+    battleWinnerIndex: room.battleWinnerIndex ?? null,
     scores: room.scores,
     groupsWon: room.groupsWon,
     players: room.players.map((player, index) => ({
@@ -1428,18 +1434,26 @@ wss.on("connection", (socket) => {
     if (type === "reveal_next") {
       if (room.phase !== "battle") return socketFail(socket, "Not in battle phase.");
       room.battleRevealCount += 1;
+      // Once all players' cards for this group are revealed, compute the winner
+      // and store it so the client can show who won and enable the score button.
+      if (room.battleRevealCount >= room.players.length) {
+        room.battleWinnerIndex = resolveBattle(room);
+      }
       broadcastRoom(room);
       return;
     }
 
     if (type === "score_group") {
       if (room.phase !== "battle") return socketFail(socket, "Not in battle phase.");
-      const winner = resolveBattle(room);
+      if (room.battleWinnerIndex == null) return socketFail(socket, "Reveal all cards first.");
+      const winner = room.battleWinnerIndex;
       room.groupsWon[winner] += 1;
       room.battleGroupIndex += 1;
       room.battleRevealCount = 0;
+      room.battleWinnerIndex = null; // Clear for the next group.
 
       if (room.battleGroupIndex >= 3) {
+        // All 3 groups done — tally round scores.
         room.groupsWon.forEach((wins, index) => {
           room.scores[index] += wins;
         });
@@ -1447,6 +1461,7 @@ wss.on("connection", (socket) => {
           room.phase = "results";
         } else {
           room.round += 1;
+          room.groupsWon = room.players.map(() => 0); // Reset per-round wins.
           dealRound(room);
         }
       }
