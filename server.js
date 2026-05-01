@@ -1454,12 +1454,9 @@ wss.on("connection", (socket) => {
 
     if (type === "reveal_next") {
       if (room.phase !== "battle") return socketFail(socket, "Not in battle phase.");
-      room.battleRevealCount += 1;
-      // Once all players' cards for this group are revealed, compute the winner
-      // and store it so the client can show who won and enable the score button.
-      if (room.battleRevealCount >= room.players.length) {
-        room.battleWinnerIndex = resolveBattle(room);
-      }
+      // Match bot/local flow: a single reveal action shows this group's cards for all players.
+      room.battleRevealCount = room.players.length;
+      room.battleWinnerIndex = resolveBattle(room);
       broadcastRoom(room);
       return;
     }
