@@ -1347,14 +1347,40 @@ wss.on("connection", (socket) => {
 
     if (type === "confirm_ready") {
       if (room.phase !== "arrange") return socketFail(socket, "Not in arrange phase.");
-      // Simultaneous arrange: no turn gating. Each player confirms independently.
-      if (player.groups.some((group) => group.length !== 3) || !player.discarded) {
-        return socketFail(socket, "Groups or discard incomplete.");
+      if (player.ready) return; // Idempotent — ignore duplicate confirms.
+
+      // The client sends the complete final arrangement in the payload.
+      // This is the authoritative card state — we use it directly rather than
+      // relying on individual move_card_to_group messages, which are not sent
+      // anymore. This guarantees client and server have identical groups in battle.
+      const { groups: groupsPayload, discarded: discardedPayload } = payload;
+
+      if (groupsPayload && discardedPayload) {
+        // Validate: must be 3 groups of 3 cards each, plus 1 discard.
+        if (
+          !Array.isArray(groupsPayload) ||
+          groupsPayload.length !== 3 ||
+          groupsPayload.some((g) => !Array.isArray(g) || g.length !== 3)
+        ) {
+          return socketFail(socket, "Invalid arrangement: need 3 groups of 3 cards.");
+        }
+        player.groups = groupsPayload;
+        player.discarded = discardedPayload;
+        player.hand = [];
+      } else {
+        // Fallback: validate what the server already tracked.
+        if (player.groups.some((group) => group.length !== 3) || !player.discarded) {
+          return socketFail(socket, "Groups or discard incomplete.");
+        }
       }
+
+      // Sort groups strongest-first (mirrors what the client does).
       player.groups = player.groups.slice().sort((a, b) => compareGroups(b, a));
       player.ready = true;
-      // Broadcast immediately so each client sees who is ready in real time.
+
+      // Broadcast immediately so all clients see this player is ready.
       broadcastRoom(room);
+
       // Transition to battle only once every player has confirmed.
       if (room.players.every((entry) => entry.ready)) {
         room.phase = "battle";
