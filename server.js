@@ -55,37 +55,6 @@ const rooms = new Map();
 const clientMeta = new Map();
 const matchmakingSockets = new Map(); // userId -> WebSocket
 
-// FIX: matchmaking is declared here (before ensureMatchRoom and attachSocketToMatchRoom)
-// so that the closures inside those functions reference a fully initialised binding.
-// Previously matchmaking was declared at line ~121, AFTER the functions that used it,
-// which is safe at call-time in practice but fragile and confusing.
-const matchmaking = createMatchmakingManager({
-  waitMs: Number(process.env.MATCHMAKING_WAIT_MS || 5000),
-  onRespond: ({ userId, payload }) => {
-    if (!payload || !payload.matchId) return;
-    if (payload.botFillApplied) return; // Bot-fill: no real room needed server-side.
-    const matchId = String(payload.matchId).trim().toUpperCase();
-    const status = matchmaking.getStatus({ matchId });
-    if (!status) return;
-
-    // Ensure room exists, then push room attachment to every matched player's socket.
-    ensureMatchRoom(matchId);
-    for (const player of status.players) {
-      const socket = matchmakingSockets.get(player.userId);
-      if (!socket || socket.readyState !== 1) continue;
-      attachSocketToMatchRoom({ socket, matchId, userId: player.userId });
-    }
-
-    writeAnalyticsEvent({
-      userId,
-      eventName: "match_assigned",
-      source: "server",
-      matchId,
-      payload: { playerCount: payload.playerCount },
-    }).catch(() => {});
-  },
-});
-
 function connectedCount(roomId) {
   let count = 0;
   clientMeta.forEach((meta, socket) => {
@@ -149,7 +118,33 @@ function attachSocketToMatchRoom({ socket, matchId, userId }) {
   }
 }
 
-// matchmaking is declared earlier in this file (above ensureMatchRoom).
+const matchmaking = createMatchmakingManager({
+  waitMs: Number(process.env.MATCHMAKING_WAIT_MS || 5000),
+  onRespond: ({ userId, payload }) => {
+    if (!payload || !payload.matchId) return;
+    if (payload.botFillApplied) return;
+    const matchId = String(payload.matchId).trim().toUpperCase();
+    const status = matchmaking.getStatus({ matchId });
+    if (!status) return;
+
+    // Ensure room exists and auto-attach any listening sockets.
+    ensureMatchRoom(matchId);
+    for (const player of status.players) {
+      const socket = matchmakingSockets.get(player.userId);
+      if (!socket || socket.readyState !== 1) continue;
+      attachSocketToMatchRoom({ socket, matchId, userId: player.userId });
+    }
+
+    // Optional: analytics for match assignment.
+    writeAnalyticsEvent({
+      userId,
+      eventName: "match_assigned",
+      source: "server",
+      matchId,
+      payload: { playerCount: payload.playerCount },
+    }).catch(() => {});
+  },
+});
 
 const firebaseAuth = initializeFirebaseAdmin();
 
@@ -1268,13 +1263,6 @@ wss.on("connection", (socket) => {
         if (!token) return socketFail(socket, "Missing auth token.");
         const session = await fetchUserByToken(token);
         if (!session) return socketFail(socket, "Invalid or expired auth token.");
-        // FIX: If this userId was registered on a different (stale) socket, remove it.
-        // The old code had no guard, so a reconnecting client would leave a dead socket
-        // in matchmakingSockets that the server would try to push to.
-        const existing = matchmakingSockets.get(session.userId);
-        if (existing && existing !== socket) {
-          existing.close(1000, "Replaced by new connection");
-        }
         matchmakingSockets.set(session.userId, socket);
         send(socket, "matchmaking_listening", { ok: true });
         return;
@@ -1331,7 +1319,8 @@ wss.on("connection", (socket) => {
 
     if (type === "move_card_to_group") {
       if (room.phase !== "arrange") return socketFail(socket, "Not in arrange phase.");
-      if (meta.playerIndex !== room.activeArrangePlayerIndex) return socketFail(socket, "Not your turn.");
+      // Simultaneous arrange: each player acts on their own hand independently.
+      // No turn gating here.
       const { cardIndex, groupIndex } = payload;
       if (!Number.isInteger(cardIndex) || !Number.isInteger(groupIndex)) return socketFail(socket, "Invalid move.");
       if (groupIndex < 0 || groupIndex > 2) return socketFail(socket, "Invalid group.");
@@ -1345,7 +1334,7 @@ wss.on("connection", (socket) => {
 
     if (type === "discard_card") {
       if (room.phase !== "arrange") return socketFail(socket, "Not in arrange phase.");
-      if (meta.playerIndex !== room.activeArrangePlayerIndex) return socketFail(socket, "Not your turn.");
+      // Simultaneous arrange: no turn gating.
       const { cardIndex } = payload;
       if (player.discarded) return socketFail(socket, "Card already discarded.");
       if (player.groups.some((group) => group.length !== 3)) return socketFail(socket, "Finish all groups first.");
@@ -1358,21 +1347,55 @@ wss.on("connection", (socket) => {
 
     if (type === "confirm_ready") {
       if (room.phase !== "arrange") return socketFail(socket, "Not in arrange phase.");
-      if (meta.playerIndex !== room.activeArrangePlayerIndex) return socketFail(socket, "Not your turn.");
+      // Simultaneous arrange: no turn gating. Each player confirms independently.
       if (player.groups.some((group) => group.length !== 3) || !player.discarded) {
         return socketFail(socket, "Groups or discard incomplete.");
       }
       player.groups = player.groups.slice().sort((a, b) => compareGroups(b, a));
       player.ready = true;
+      // Broadcast immediately so each client sees who is ready in real time.
+      broadcastRoom(room);
+      // Transition to battle only once every player has confirmed.
       if (room.players.every((entry) => entry.ready)) {
         room.phase = "battle";
-        room.activeArrangePlayerIndex = 0;
         room.battleGroupIndex = 0;
         room.battleRevealCount = 0;
-      } else {
-        room.activeArrangePlayerIndex = nextUnreadyPlayer(room);
+        broadcastRoom(room);
       }
+      return;
+    }
+
+    // Sent by the client when the arrange timer expires and the player hasn't
+    // manually confirmed. Server auto-arranges their hand and marks them ready.
+    if (type === "auto_ready") {
+      if (room.phase !== "arrange") return;
+      if (player.ready) return; // Already ready, nothing to do.
+      // Auto-arrange: find the best grouping from the full hand.
+      const allCards = [...player.hand, ...player.groups.flat()];
+      if (player.discarded) allCards.push(player.discarded);
+      // Reset and auto-fill
+      player.discarded = null;
+      player.groups = [[], [], []];
+      player.hand = allCards;
+      // Simple auto-arrange: sort by value descending, take first 9, discard last
+      const sorted = [...allCards].sort((a, b) => b.value - a.value);
+      player.discarded = sorted[sorted.length - 1];
+      const remaining = sorted.slice(0, 9);
+      player.groups = [
+        remaining.slice(0, 3),
+        remaining.slice(3, 6),
+        remaining.slice(6, 9),
+      ];
+      player.groups = player.groups.slice().sort((a, b) => compareGroups(b, a));
+      player.hand = [];
+      player.ready = true;
       broadcastRoom(room);
+      if (room.players.every((entry) => entry.ready)) {
+        room.phase = "battle";
+        room.battleGroupIndex = 0;
+        room.battleRevealCount = 0;
+        broadcastRoom(room);
+      }
       return;
     }
 
@@ -1410,7 +1433,7 @@ wss.on("connection", (socket) => {
   });
 
   socket.on("close", () => {
-    // Remove from matchmaking socket registry if registered.
+    // If this socket was registered for matchmaking, remove it.
     matchmakingSockets.forEach((value, key) => {
       if (value === socket) matchmakingSockets.delete(key);
     });
@@ -1420,32 +1443,15 @@ wss.on("connection", (socket) => {
     if (!meta) return;
     const room = rooms.get(meta.roomId);
     if (!room) return;
-
-    // FIX: The old code spliced room.players and re-indexed, which corrupted
-    // clientMeta.playerIndex for all remaining connected sockets (their stored
-    // index no longer matched the array position after re-indexing).
-    //
-    // Instead: mark the player slot as disconnected but keep the array stable.
-    // This preserves every other socket's playerIndex reference.
-    // If all slots are empty, clean up the room entirely.
-    const disconnectedIndex = meta.playerIndex;
-    if (disconnectedIndex >= 0 && disconnectedIndex < room.players.length) {
-      room.players[disconnectedIndex] = {
-        ...room.players[disconnectedIndex],
-        disconnected: true,
-      };
-    }
-
-    // Check if any socket is still connected to this room.
-    let anyConnected = false;
-    clientMeta.forEach((m, s) => {
-      if (m.roomId === room.id && s.readyState === 1) anyConnected = true;
-    });
-    if (!anyConnected) {
-      rooms.delete(room.id);
+    room.players = room.players.filter((_, index) => index !== meta.playerIndex);
+    if (room.players.length === 0) {
+      rooms.delete(meta.roomId);
       return;
     }
-
+    room.players = room.players.map((player, index) => ({ ...player, id: index }));
+    room.scores = room.players.map((_, index) => room.scores[index] || 0);
+    room.groupsWon = room.players.map((_, index) => room.groupsWon[index] || 0);
+    room.activeArrangePlayerIndex = Math.min(room.activeArrangePlayerIndex, room.players.length - 1);
     broadcastRoom(room);
   });
 });
