@@ -119,6 +119,12 @@ function attachSocketToMatchRoom({ socket, matchId, userId }) {
   }
 }
 
+function isMatchmakingRoomId(roomId) {
+  const normalized = String(roomId || "").trim().toUpperCase();
+  if (!normalized) return false;
+  return Boolean(matchmaking.getStatus({ matchId: normalized }));
+}
+
 const matchmaking = createMatchmakingManager({
   waitMs: Number(process.env.MATCHMAKING_WAIT_MS || 5000),
   onRespond: ({ userId, payload }) => {
@@ -1294,7 +1300,22 @@ wss.on("connection", (socket) => {
     }
 
     if (type === "join_room") {
-      const room = rooms.get(String(payload.roomId || "").toUpperCase());
+      const roomId = String(payload.roomId || "").trim().toUpperCase();
+      if (!roomId) return socketFail(socket, "Missing roomId.");
+
+      // Back-compat / safety: if the client is trying to join a matchmaking-created
+      // room via join_room, treat it as join_match instead of adding a new seat.
+      // Adding seats to a matchmaking room corrupts player indices and scoring.
+      if (isMatchmakingRoomId(roomId)) {
+        const token = String(payload.authToken || payload.token || "").trim();
+        if (!token) return socketFail(socket, "Missing auth token.");
+        const session = await fetchUserByToken(token);
+        if (!session) return socketFail(socket, "Invalid or expired auth token.");
+        attachSocketToMatchRoom({ socket, matchId: roomId, userId: session.userId });
+        return;
+      }
+
+      const room = rooms.get(roomId);
       if (!room) return socketFail(socket, "Room not found.");
       if (room.players.length >= 4) return socketFail(socket, "Room is full.");
       const playerIndex = room.players.length;
