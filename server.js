@@ -1374,10 +1374,10 @@ wss.on("connection", (socket) => {
 
     if (type === "confirm_ready") {
       if (room.phase !== "arrange") return socketFail(socket, "Not in arrange phase.");
-      if (player.ready) return; // Idempotent — ignore duplicate confirms.
+      if (player.ready) return; // Idempotent â€” ignore duplicate confirms.
 
       // The client sends the complete final arrangement in the payload.
-      // This is the authoritative card state — we use it directly rather than
+      // This is the authoritative card state â€” we use it directly rather than
       // relying on individual move_card_to_group messages, which are not sent
       // anymore. This guarantees client and server have identical groups in battle.
       const { groups: groupsPayload, discarded: discardedPayload } = payload;
@@ -1474,10 +1474,18 @@ wss.on("connection", (socket) => {
       room.battleWinnerIndex = null; // Clear for the next group.
 
       if (room.battleGroupIndex >= 3) {
-        // All 3 groups done — tally round scores.
-        room.groupsWon.forEach((wins, index) => {
-          room.scores[index] += wins;
-        });
+        // All 3 groups done — determine the round winner (same scoring as bot/local flow):
+        // - scores[] tracks rounds won (1 point per round)
+        // - groupsWon[] tracks per-round group wins (shown as "pts" during battle)
+        const maxWins = Math.max(...room.groupsWon);
+        const roundWinners = room.groupsWon
+          .map((wins, index) => ({ wins, index }))
+          .filter((entry) => entry.wins === maxWins)
+          .map((entry) => entry.index);
+        const roundWinnerIndex = roundWinners.length === 1 ? roundWinners[0] : null;
+        if (roundWinnerIndex != null) {
+          room.scores[roundWinnerIndex] = (room.scores[roundWinnerIndex] || 0) + 1;
+        }
         if (room.round >= room.totalRounds) {
           room.phase = "results";
         } else {
@@ -1528,3 +1536,4 @@ ensureSchema()
     console.error("Failed to initialize database schema.", error);
     process.exit(1);
   });
+
