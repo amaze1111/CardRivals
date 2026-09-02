@@ -72,18 +72,24 @@ function ensureMatchRoom(matchId) {
   if (existing) return existing;
   const status = matchmaking.getStatus({ matchId: normalized });
   if (!status) return null;
+  const cfg = modeConfig(status.mode);
   const room = {
     id: normalized,
     phase: "lobby",
     round: 1,
     totalRounds: 3,
+    mode: status.mode || "ten",
+    groupCount: cfg.groupCount,
+    cardsPerHand: cfg.cardsPerHand,
+    hasDiscard: cfg.hasDiscard,
     activeArrangePlayerIndex: 0,
     battleGroupIndex: 0,
     battleRevealCount: 0,
     battleWinnerIndex: null,
     scores: status.players.map(() => 0),
     groupsWon: status.players.map(() => 0),
-    players: status.players.map((p, index) => createPlayer(p.displayName || `Player ${index + 1}`, index)),
+    players: status.players.map((p, index) =>
+      createPlayer(p.displayName || `Player ${index + 1}`, index, cfg.groupCount)),
   };
   rooms.set(normalized, room);
   return room;
@@ -767,6 +773,7 @@ async function handleMatchmakingStatus(req, res) {
   json(res, 200, {
     matchId: status.matchId,
     playerCount: status.playerCount,
+    mode: status.mode || "ten",
     opponentDisplayNames,
   });
 }
@@ -776,62 +783,40 @@ async function handleMatchmakingJoin(req, res) {
   if (!session) return;
   const body = await parseBody(req);
   const playerCount = Number(body.playerCount || 0);
+  const mode = body.mode === "fifteen" ? "fifteen" : "ten";
   const entryFee = MATCH_ENTRY_FEES[playerCount];
   if (!entryFee) {
     fail(res, 400, "Unsupported player count.");
     return;
   }
 
-  // IMPORTANT: matchId is now created by matchmaking manager (when paired / bot-filled).
+  // matchId is created by the matchmaking manager (when paired / bot-filled).
   const rewardPool = entryFee * playerCount;
-  const joinAttemptId = crypto.randomBytes(10).toString("hex");
 
-  const client = await db.connect();
+  // Matchmaking is FREE. The coin economy is headless — settled server-side on
+  // match completion and never surfaced in the app — so joining a queue is no
+  // longer gated on a coin balance, nor charged an entry fee. coinBalance below
+  // is informational only.
+  let coinBalance = 0;
   try {
-    await client.query("BEGIN");
-    const userResult = await client.query(`SELECT id, coins FROM users WHERE id = $1 FOR UPDATE`, [session.userId]);
-    if (!userResult.rowCount) throw new Error("User not found.");
-    const user = userResult.rows[0];
-    if (user.coins < entryFee) {
-      await client.query("ROLLBACK");
-      fail(res, 400, "Not enough coins to join this queue.");
-      return;
-    }
-
-    const updatedCoins = user.coins - entryFee;
-    await client.query(`UPDATE users SET coins = $2, rank_tier = $3 WHERE id = $1`, [
-      session.userId,
-      updatedCoins,
-      computeRankTier(updatedCoins),
-    ]);
-    await recordCoinTransaction(client, {
-      userId: session.userId,
-      transactionType: "match_entry",
-      amount: -entryFee,
-      balanceAfter: updatedCoins,
-      idempotencyKey: `entryAttempt:${session.userId}:${joinAttemptId}`,
-      metadata: { playerCount, entryFee, rewardPool },
-    });
-    await client.query("COMMIT");
-
-    matchmaking.join({
-      req,
-      res,
-      userId: session.userId,
-      displayName: session.displayName || "Player",
-      playerCount,
-      entryFee,
-      rewardPool,
-      coinBalance: updatedCoins,
-      isRanked: true,
-    });
-    return;
-  } catch (error) {
-    await client.query("ROLLBACK");
-    fail(res, 500, error instanceof Error ? error.message : "Could not join matchmaking.");
-  } finally {
-    client.release();
+    const userResult = await db.query(`SELECT coins FROM users WHERE id = $1`, [session.userId]);
+    coinBalance = userResult.rows[0]?.coins ?? 0;
+  } catch {
+    // Non-fatal: the balance is not required to join.
   }
+
+  matchmaking.join({
+    req,
+    res,
+    userId: session.userId,
+    displayName: session.displayName || "Player",
+    playerCount,
+    mode,
+    entryFee,
+    rewardPool,
+    coinBalance,
+    isRanked: true,
+  });
 }
 
 async function handleDailyClaim(req, res) {
@@ -1078,11 +1063,34 @@ function id() {
   return Math.random().toString(36).slice(2, 8).toUpperCase();
 }
 
-function buildDeck() {
+// "ten" is the original 10-card / 3-group game. "fifteen" is the Big Hand
+// variant: 15 cards, 5 groups of 3, no discard.
+function modeConfig(mode) {
+  return mode === "fifteen"
+    ? { cardsPerHand: 15, groupCount: 5, hasDiscard: false }
+    : { cardsPerHand: 10, groupCount: 3, hasDiscard: true };
+}
+
+function emptyGroups(count) {
+  return Array.from({ length: count }, () => []);
+}
+
+function buildDeck(deckCount = 1) {
+  const copies = Math.max(1, deckCount);
   const deck = [];
-  for (const suit of SUITS) {
-    for (const [rank, value] of RANKS) {
-      deck.push({ rank, value, suit, id: `${rank}${suit}` });
+  for (let copy = 0; copy < copies; copy += 1) {
+    for (const suit of SUITS) {
+      for (const [rank, value] of RANKS) {
+        deck.push({
+          rank,
+          value,
+          suit,
+          // Suffix the id only when a second deck is in play (15-card 4-player),
+          // so the two identical cards stay distinct on the client.
+          id: copies > 1 ? `${rank}${suit}#${copy}` : `${rank}${suit}`,
+          copyIndex: copy,
+        });
+      }
     }
   }
   for (let i = deck.length - 1; i > 0; i -= 1) {
@@ -1092,12 +1100,12 @@ function buildDeck() {
   return deck;
 }
 
-function createPlayer(name, index) {
+function createPlayer(name, index, groupCount = 3) {
   return {
     id: index,
     name,
     hand: [],
-    groups: [[], [], []],
+    groups: emptyGroups(groupCount),
     discarded: null,
     ready: false,
   };
@@ -1110,6 +1118,10 @@ function createRoom(hostName) {
     phase: "lobby",
     round: 1,
     totalRounds: 3,
+    mode: "ten",
+    groupCount: 3,
+    cardsPerHand: 10,
+    hasDiscard: true,
     activeArrangePlayerIndex: 0,
     battleGroupIndex: 0,
     battleRevealCount: 0,
@@ -1123,12 +1135,16 @@ function createRoom(hostName) {
 }
 
 function dealRound(room) {
-  const deck = buildDeck();
+  const groupCount = room.groupCount || 3;
+  const cardsPerHand = room.cardsPerHand || 10;
+  const needed = cardsPerHand * room.players.length;
+  const deckCount = Math.max(1, Math.ceil(needed / 52));
+  const deck = buildDeck(deckCount);
   room.players = room.players.map((player, index) => ({
     ...player,
     id: index,
-    hand: deck.splice(0, 10),
-    groups: [[], [], []],
+    hand: deck.splice(0, cardsPerHand),
+    groups: emptyGroups(groupCount),
     discarded: null,
     ready: false,
   }));
@@ -1195,11 +1211,14 @@ function nextUnreadyPlayer(room) {
 }
 
 function sanitizeRoomState(room, playerIndex) {
+  const groupCount = room.groupCount || 3;
   return {
     id: room.id,
     phase: room.phase,
     round: room.round,
     totalRounds: room.totalRounds,
+    mode: room.mode || "ten",
+    groupCount,
     localPlayerIndex: playerIndex,
     activeArrangePlayerIndex: room.activeArrangePlayerIndex,
     battleGroupIndex: room.battleGroupIndex,
@@ -1217,7 +1236,7 @@ function sanitizeRoomState(room, playerIndex) {
       hand: index === playerIndex ? player.hand : [],
       groups: index === playerIndex || room.phase === "battle" || room.phase === "results"
         ? player.groups
-        : [[], [], []],
+        : emptyGroups(groupCount),
     })),
   };
 }
@@ -1350,7 +1369,7 @@ wss.on("connection", (socket) => {
       // No turn gating here.
       const { cardIndex, groupIndex } = payload;
       if (!Number.isInteger(cardIndex) || !Number.isInteger(groupIndex)) return socketFail(socket, "Invalid move.");
-      if (groupIndex < 0 || groupIndex > 2) return socketFail(socket, "Invalid group.");
+      if (groupIndex < 0 || groupIndex > (room.groupCount || 3) - 1) return socketFail(socket, "Invalid group.");
       if (!player.hand[cardIndex]) return socketFail(socket, "Card not found.");
       if (player.groups[groupIndex].length >= 3) return socketFail(socket, "Group is full.");
       const [card] = player.hand.splice(cardIndex, 1);
@@ -1361,6 +1380,7 @@ wss.on("connection", (socket) => {
 
     if (type === "discard_card") {
       if (room.phase !== "arrange") return socketFail(socket, "Not in arrange phase.");
+      if (room.hasDiscard === false) return socketFail(socket, "This mode has no discard.");
       // Simultaneous arrange: no turn gating.
       const { cardIndex } = payload;
       if (player.discarded) return socketFail(socket, "Card already discarded.");
@@ -1374,29 +1394,36 @@ wss.on("connection", (socket) => {
 
     if (type === "confirm_ready") {
       if (room.phase !== "arrange") return socketFail(socket, "Not in arrange phase.");
-      if (player.ready) return; // Idempotent â€” ignore duplicate confirms.
+      if (player.ready) return; // Idempotent — ignore duplicate confirms.
 
       // The client sends the complete final arrangement in the payload.
-      // This is the authoritative card state â€” we use it directly rather than
+      // This is the authoritative card state — we use it directly rather than
       // relying on individual move_card_to_group messages, which are not sent
       // anymore. This guarantees client and server have identical groups in battle.
       const { groups: groupsPayload, discarded: discardedPayload } = payload;
+      const groupCount = room.groupCount || 3;
+      const needDiscard = room.hasDiscard !== false;
 
-      if (groupsPayload && discardedPayload) {
-        // Validate: must be 3 groups of 3 cards each, plus 1 discard.
+      if (Array.isArray(groupsPayload)) {
+        // Validate: groupCount groups of 3 cards each, plus a discard for "ten".
         if (
-          !Array.isArray(groupsPayload) ||
-          groupsPayload.length !== 3 ||
+          groupsPayload.length !== groupCount ||
           groupsPayload.some((g) => !Array.isArray(g) || g.length !== 3)
         ) {
-          return socketFail(socket, "Invalid arrangement: need 3 groups of 3 cards.");
+          return socketFail(socket, `Invalid arrangement: need ${groupCount} groups of 3 cards.`);
+        }
+        if (needDiscard && !discardedPayload) {
+          return socketFail(socket, "Invalid arrangement: missing discard.");
         }
         player.groups = groupsPayload;
-        player.discarded = discardedPayload;
+        player.discarded = needDiscard ? discardedPayload : null;
         player.hand = [];
       } else {
         // Fallback: validate what the server already tracked.
-        if (player.groups.some((group) => group.length !== 3) || !player.discarded) {
+        if (
+          player.groups.some((group) => group.length !== 3) ||
+          (needDiscard && !player.discarded)
+        ) {
           return socketFail(socket, "Groups or discard incomplete.");
         }
       }
@@ -1423,22 +1450,18 @@ wss.on("connection", (socket) => {
     if (type === "auto_ready") {
       if (room.phase !== "arrange") return;
       if (player.ready) return; // Already ready, nothing to do.
-      // Auto-arrange: find the best grouping from the full hand.
+      // Auto-arrange: find a grouping from the full hand.
+      const groupCount = room.groupCount || 3;
+      const needDiscard = room.hasDiscard !== false;
       const allCards = [...player.hand, ...player.groups.flat()];
       if (player.discarded) allCards.push(player.discarded);
-      // Reset and auto-fill
-      player.discarded = null;
-      player.groups = [[], [], []];
-      player.hand = allCards;
-      // Simple auto-arrange: sort by value descending, take first 9, discard last
+      // Simple auto-arrange: sort by value descending; drop the last card only
+      // when the mode has a discard, then chunk into groups of 3.
       const sorted = [...allCards].sort((a, b) => b.value - a.value);
-      player.discarded = sorted[sorted.length - 1];
-      const remaining = sorted.slice(0, 9);
-      player.groups = [
-        remaining.slice(0, 3),
-        remaining.slice(3, 6),
-        remaining.slice(6, 9),
-      ];
+      player.discarded = needDiscard ? sorted[sorted.length - 1] : null;
+      const remaining = sorted.slice(0, groupCount * 3);
+      player.groups = Array.from({ length: groupCount }, (_, g) =>
+        remaining.slice(g * 3, g * 3 + 3));
       player.groups = player.groups.slice().sort((a, b) => compareGroups(b, a));
       player.hand = [];
       player.ready = true;
@@ -1470,10 +1493,8 @@ wss.on("connection", (socket) => {
       room.battleRevealCount = 0;
       room.battleWinnerIndex = null; // Clear for the next group.
 
-      if (room.battleGroupIndex >= 3) {
-        // All 3 groups done — determine the round winner (same scoring as bot/local flow):
-        // - scores[] tracks rounds won (1 point per round)
-        // - groupsWon[] tracks per-round group wins (shown as "pts" during battle)
+      if (room.battleGroupIndex >= (room.groupCount || 3)) {
+        // All groups done — tally round scores.
         const maxWins = Math.max(...room.groupsWon);
         const roundWinners = room.groupsWon
           .map((wins, index) => ({ wins, index }))
@@ -1533,4 +1554,3 @@ ensureSchema()
     console.error("Failed to initialize database schema.", error);
     process.exit(1);
   });
-

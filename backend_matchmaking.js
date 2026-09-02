@@ -18,11 +18,17 @@ export function createMatchmakingManager({
   createMatchId = defaultCreateMatchId,
   onRespond,
 } = {}) {
-  const queues  = new Map(); // playerCount -> Pending[]
-  const matches = new Map(); // matchId -> { playerCount, players, createdAtMs }
+  const queues  = new Map(); // `${playerCount}:${mode}` -> Pending[]
+  const matches = new Map(); // matchId -> { playerCount, mode, players, createdAtMs }
 
-  function queueFor(playerCount) {
-    const key = String(playerCount);
+  function normalizeMode(mode) {
+    return mode === "fifteen" ? "fifteen" : "ten";
+  }
+
+  function queueFor(playerCount, mode) {
+    // 15-card and 10-card players must never land in the same match, so the
+    // mode is part of the queue key.
+    const key = `${playerCount}:${normalizeMode(mode)}`;
     let queue = queues.get(key);
     if (!queue) {
       queue = [];
@@ -36,13 +42,17 @@ export function createMatchmakingManager({
     if (index !== -1) queue.splice(index, 1);
   }
 
-  function dropExistingForUser(queue, userId) {
-    for (let i = queue.length - 1; i >= 0; i -= 1) {
-      if (queue[i].userId !== userId) continue;
-      const pending = queue[i];
-      queue.splice(i, 1);
-      clearTimeout(pending.timeoutId);
-      pending.respond(409, { error: "Already queued for matchmaking." });
+  function dropExistingForUser(userId) {
+    // Search every queue, not just one, so a user switching mode/player-count
+    // while queued cannot leave a stale pending entry behind.
+    for (const queue of queues.values()) {
+      for (let i = queue.length - 1; i >= 0; i -= 1) {
+        if (queue[i].userId !== userId) continue;
+        const pending = queue[i];
+        queue.splice(i, 1);
+        clearTimeout(pending.timeoutId);
+        pending.respond(409, { error: "Already queued for matchmaking." });
+      }
     }
   }
 
@@ -97,10 +107,11 @@ export function createMatchmakingManager({
     return queue.splice(0, playerCount - 1);
   }
 
-  function upsertMatch(matchId, playerCount, players) {
+  function upsertMatch(matchId, playerCount, players, mode) {
     matches.set(matchId, {
       matchId,
       playerCount,
+      mode: normalizeMode(mode),
       players,
       createdAtMs: Date.now(),
     });
@@ -118,6 +129,7 @@ export function createMatchmakingManager({
       userId,
       displayName = "Player",
       playerCount,
+      mode = "ten",
       entryFee,
       rewardPool,
       coinBalance,
@@ -130,8 +142,9 @@ export function createMatchmakingManager({
         return;
       }
 
-      const queue = queueFor(playerCount);
-      dropExistingForUser(queue, userId);
+      const matchMode = normalizeMode(mode);
+      const queue = queueFor(playerCount, matchMode);
+      dropExistingForUser(userId);
 
       const match = tryMatch(queue, playerCount);
       if (match) {
@@ -140,7 +153,7 @@ export function createMatchmakingManager({
           { userId, displayName },
           ...match.map((pending) => ({ userId: pending.userId, displayName: pending.displayName })),
         ];
-        upsertMatch(matchId, playerCount, matchPlayers);
+        upsertMatch(matchId, playerCount, matchPlayers, matchMode);
 
         // Respond to all queued players who are now matched.
         respondGroup(
@@ -148,6 +161,7 @@ export function createMatchmakingManager({
           (pending) => ({
             matchId,
             playerCount,
+            mode: matchMode,
             entryFee,
             rewardPool,
             coinBalance: pending.coinBalance,
@@ -163,6 +177,7 @@ export function createMatchmakingManager({
         const payload = {
           matchId,
           playerCount,
+          mode: matchMode,
           entryFee,
           rewardPool,
           coinBalance,
@@ -193,10 +208,11 @@ export function createMatchmakingManager({
       pending.timeoutId = setTimeout(() => {
         remove(queue, pending);
         const matchId = createMatchId();
-        upsertMatch(matchId, playerCount, [{ userId, displayName }]);
+        upsertMatch(matchId, playerCount, [{ userId, displayName }], matchMode);
         const payload = {
           matchId,
           playerCount,
+          mode: matchMode,
           entryFee,
           rewardPool,
           coinBalance,
