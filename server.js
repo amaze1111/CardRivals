@@ -29,6 +29,24 @@ const MATCH_ENTRY_FEES = {
   4: Number(process.env.MATCH_ENTRY_FEE_4P || 40),
 };
 
+// A matchmaking match must keep progressing even when a player's device is
+// frozen (screen lock / Doze) or their network drops — those clients stop
+// sending confirm_ready / reveal_next and, before these, the whole room hung
+// for every player until it was force-quit.
+//
+// - ARRANGE_TIMEOUT_MS: server auto-arranges any player who hasn't confirmed
+//   and moves the room to battle. Longer than the client's 60 s arrange timer
+//   so a healthy client's own auto_ready always wins the race.
+// - BATTLE_STEP_TIMEOUT_MS: server auto-advances the showdown (reveal, then
+//   score) so an absent player can't stall it. Any connected player can still
+//   drive it faster by tapping.
+// - MATCH_ABANDON_MS: once NOBODY is connected to a room, it's retired after
+//   this grace period (covers a brief double-drop, e.g. a server blip).
+const ARRANGE_TIMEOUT_MS = Number(process.env.ARRANGE_TIMEOUT_MS || 75000);
+const BATTLE_STEP_TIMEOUT_MS = Number(process.env.BATTLE_STEP_TIMEOUT_MS || 25000);
+const MATCH_ABANDON_MS = Number(process.env.MATCH_ABANDON_MS || 120000);
+const WS_HEARTBEAT_MS = Number(process.env.WS_HEARTBEAT_MS || 30000);
+
 const SUITS = ["\u2660", "\u2665", "\u2666", "\u2663"];
 const RANKS = [
   ["A", 14], ["2", 2], ["3", 3], ["4", 4], ["5", 5], ["6", 6], ["7", 7],
@@ -88,8 +106,18 @@ function ensureMatchRoom(matchId) {
     battleWinnerIndex: null,
     scores: status.players.map(() => 0),
     groupsWon: status.players.map(() => 0),
-    players: status.players.map((p, index) =>
-      createPlayer(p.displayName || `Player ${index + 1}`, index, cfg.groupCount)),
+    players: status.players.map((p, index) => ({
+      // userId pins the seat to a person, so a reconnecting socket rebinds to
+      // the same hand/groups/score instead of being dropped and re-indexed.
+      // `connected` tracks live socket presence for the abandon grace timer.
+      ...createPlayer(p.displayName || `Player ${index + 1}`, index, cfg.groupCount),
+      userId: p.userId,
+      connected: false,
+    })),
+    // Per-room timer handles (arrange auto-advance, battle step auto-advance,
+    // abandon grace). Never serialised to clients — sanitizeRoomState rebuilds
+    // the payload field by field.
+    timers: { arrange: null, battle: null, abandon: null },
   };
   rooms.set(normalized, room);
   return room;
@@ -111,7 +139,21 @@ function attachSocketToMatchRoom({ socket, matchId, userId }) {
     socketFail(socket, "Room not found.");
     return;
   }
-  clientMeta.set(socket, { roomId: room.id, playerIndex });
+
+  // Reconnect handling: evict any earlier socket still bound to this seat. Its
+  // eventual 'close' would otherwise tear down the seat we're rebinding (and it
+  // would keep receiving broadcasts for a player who has already moved on).
+  clientMeta.forEach((otherMeta, otherSocket) => {
+    if (otherSocket === socket) return;
+    if (otherMeta.roomId === room.id && otherMeta.playerIndex === playerIndex) {
+      clientMeta.delete(otherSocket);
+      try { otherSocket.close(4000, "Replaced by a newer connection"); } catch {}
+    }
+  });
+
+  clientMeta.set(socket, { roomId: room.id, playerIndex, userId });
+  if (room.players[playerIndex]) room.players[playerIndex].connected = true;
+  clearRoomTimer(room, "abandon");
   send(socket, "match_joined", { roomId: room.id, playerIndex, matchId: room.id });
   broadcastRoom(room);
 
@@ -1153,6 +1195,10 @@ function dealRound(room) {
   room.battleGroupIndex = 0;
   room.battleRevealCount = 0;
   room.battleWinnerIndex = null;
+  // A fresh arrange phase: no battle step pending, and the server owns a
+  // fallback deadline in case a client never sends confirm_ready / auto_ready.
+  clearRoomTimer(room, "battle");
+  scheduleArrangeTimeout(room);
 }
 
 function evaluateGroup(cards) {
@@ -1248,6 +1294,164 @@ function broadcastRoom(room) {
   });
 }
 
+// ---------------------------------------------------------------------------
+// Keep-the-match-moving timers.
+//
+// Every one of these does exactly what a client tap would have done — they are
+// a fallback for when the tap never arrives (frozen device, lost network), not
+// a separate code path. Any still-connected player can always drive the match
+// faster by acting normally.
+// ---------------------------------------------------------------------------
+
+function roomTimers(room) {
+  if (!room.timers) room.timers = { arrange: null, battle: null, abandon: null };
+  return room.timers;
+}
+
+function clearRoomTimer(room, key) {
+  const timers = room && room.timers;
+  if (timers && timers[key]) {
+    clearTimeout(timers[key]);
+    timers[key] = null;
+  }
+}
+
+function clearAllRoomTimers(room) {
+  clearRoomTimer(room, "arrange");
+  clearRoomTimer(room, "battle");
+  clearRoomTimer(room, "abandon");
+}
+
+// Auto-arrange one player's hand and mark them ready. Mirrors the "auto_ready"
+// message handler (same simple sort-and-chunk the client uses on timeout).
+function autoArrangePlayer(room, player) {
+  const groupCount = room.groupCount || 3;
+  const needDiscard = room.hasDiscard !== false;
+  const allCards = [...player.hand, ...player.groups.flat()];
+  if (player.discarded) allCards.push(player.discarded);
+  const sorted = [...allCards].sort((a, b) => b.value - a.value);
+  player.discarded = needDiscard ? sorted[sorted.length - 1] : null;
+  const remaining = sorted.slice(0, groupCount * 3);
+  player.groups = Array.from({ length: groupCount }, (_, g) => remaining.slice(g * 3, g * 3 + 3));
+  player.groups = player.groups.slice().sort((a, b) => compareGroups(b, a));
+  player.hand = [];
+  player.ready = true;
+}
+
+function enterBattle(room) {
+  room.phase = "battle";
+  room.battleGroupIndex = 0;
+  room.battleRevealCount = 0;
+  room.battleWinnerIndex = null;
+  clearRoomTimer(room, "arrange");
+  scheduleBattleTimeout(room);
+}
+
+function scheduleArrangeTimeout(room) {
+  const timers = roomTimers(room);
+  clearRoomTimer(room, "arrange");
+  timers.arrange = setTimeout(() => {
+    if (!rooms.has(room.id) || room.phase !== "arrange") return;
+    let changed = false;
+    for (const player of room.players) {
+      if (!player.ready) {
+        autoArrangePlayer(room, player);
+        changed = true;
+      }
+    }
+    if (room.players.every((p) => p.ready)) {
+      enterBattle(room);
+    }
+    if (changed) broadcastRoom(room);
+  }, ARRANGE_TIMEOUT_MS);
+}
+
+function scheduleBattleTimeout(room) {
+  const timers = roomTimers(room);
+  clearRoomTimer(room, "battle");
+  timers.battle = setTimeout(() => {
+    if (!rooms.has(room.id) || room.phase !== "battle") return;
+    if (room.battleWinnerIndex == null) revealCurrentGroup(room);
+    else scoreCurrentGroup(room);
+  }, BATTLE_STEP_TIMEOUT_MS);
+}
+
+// Flip the current battle group face-up for everyone and resolve its winner.
+// Same effect as any player sending "reveal_next".
+function revealCurrentGroup(room) {
+  if (room.phase !== "battle") return;
+  room.battleRevealCount = room.players.length;
+  room.battleWinnerIndex = resolveBattle(room);
+  broadcastRoom(room);
+  scheduleBattleTimeout(room); // then auto-advance to scoring
+}
+
+// Award the current group to its winner and advance to the next group / round /
+// results. Same effect as any player sending "score_group".
+function scoreCurrentGroup(room) {
+  if (room.phase !== "battle" || room.battleWinnerIndex == null) return;
+  const winner = room.battleWinnerIndex;
+  room.groupsWon[winner] += 1;
+  room.battleGroupIndex += 1;
+  room.battleRevealCount = 0;
+  room.battleWinnerIndex = null;
+
+  if (room.battleGroupIndex >= (room.groupCount || 3)) {
+    const maxWins = Math.max(...room.groupsWon);
+    const roundWinners = room.groupsWon
+      .map((wins, index) => ({ wins, index }))
+      .filter((entry) => entry.wins === maxWins)
+      .map((entry) => entry.index);
+    const roundWinnerIndex = roundWinners.length === 1 ? roundWinners[0] : null;
+    if (roundWinnerIndex != null) {
+      room.scores[roundWinnerIndex] = (room.scores[roundWinnerIndex] || 0) + 1;
+    }
+    if (room.round >= room.totalRounds) {
+      room.phase = "results";
+      clearRoomTimer(room, "battle");
+      clearRoomTimer(room, "arrange");
+    } else {
+      room.round += 1;
+      room.groupsWon = room.players.map(() => 0);
+      dealRound(room); // re-arms the arrange timeout, clears the battle timer
+    }
+  } else {
+    scheduleBattleTimeout(room); // next group's reveal
+  }
+
+  broadcastRoom(room);
+}
+
+function anySocketBoundToSeat(roomId, playerIndex) {
+  let found = false;
+  clientMeta.forEach((meta, socket) => {
+    if (meta.roomId === roomId && meta.playerIndex === playerIndex && socket.readyState === 1) {
+      found = true;
+    }
+  });
+  return found;
+}
+
+// Nobody is connected to this room. Give it a grace window (a brief double-drop
+// or a server blip can knock everyone off at once) and then retire it so the
+// in-memory maps and timers don't leak.
+function armRoomAbandon(room) {
+  const timers = roomTimers(room);
+  clearRoomTimer(room, "abandon");
+  timers.abandon = setTimeout(() => {
+    if (!rooms.has(room.id) || connectedCount(room.id) > 0) return;
+    retireRoom(room);
+  }, MATCH_ABANDON_MS);
+}
+
+function retireRoom(room) {
+  clearAllRoomTimers(room);
+  rooms.delete(room.id);
+  clientMeta.forEach((meta, socket) => {
+    if (meta.roomId === room.id) clientMeta.delete(socket);
+  });
+}
+
 function send(socket, type, payload) {
   socket.send(JSON.stringify({ type, payload }));
 }
@@ -1277,6 +1481,9 @@ function requirePlayer(socket, room) {
 }
 
 wss.on("connection", (socket) => {
+  socket.isAlive = true;
+  socket.on("pong", markSocketAlive);
+
   socket.on("message", (raw) => {
     void (async () => {
       let message;
@@ -1437,9 +1644,7 @@ wss.on("connection", (socket) => {
 
       // Transition to battle only once every player has confirmed.
       if (room.players.every((entry) => entry.ready)) {
-        room.phase = "battle";
-        room.battleGroupIndex = 0;
-        room.battleRevealCount = 0;
+        enterBattle(room);
         broadcastRoom(room);
       }
       return;
@@ -1450,26 +1655,10 @@ wss.on("connection", (socket) => {
     if (type === "auto_ready") {
       if (room.phase !== "arrange") return;
       if (player.ready) return; // Already ready, nothing to do.
-      // Auto-arrange: find a grouping from the full hand.
-      const groupCount = room.groupCount || 3;
-      const needDiscard = room.hasDiscard !== false;
-      const allCards = [...player.hand, ...player.groups.flat()];
-      if (player.discarded) allCards.push(player.discarded);
-      // Simple auto-arrange: sort by value descending; drop the last card only
-      // when the mode has a discard, then chunk into groups of 3.
-      const sorted = [...allCards].sort((a, b) => b.value - a.value);
-      player.discarded = needDiscard ? sorted[sorted.length - 1] : null;
-      const remaining = sorted.slice(0, groupCount * 3);
-      player.groups = Array.from({ length: groupCount }, (_, g) =>
-        remaining.slice(g * 3, g * 3 + 3));
-      player.groups = player.groups.slice().sort((a, b) => compareGroups(b, a));
-      player.hand = [];
-      player.ready = true;
+      autoArrangePlayer(room, player);
       broadcastRoom(room);
       if (room.players.every((entry) => entry.ready)) {
-        room.phase = "battle";
-        room.battleGroupIndex = 0;
-        room.battleRevealCount = 0;
+        enterBattle(room);
         broadcastRoom(room);
       }
       return;
@@ -1477,43 +1666,16 @@ wss.on("connection", (socket) => {
 
     if (type === "reveal_next") {
       if (room.phase !== "battle") return socketFail(socket, "Not in battle phase.");
-      // Match bot/local flow: a single reveal action shows this group's cards for all players.
-      room.battleRevealCount = room.players.length;
-      room.battleWinnerIndex = resolveBattle(room);
-      broadcastRoom(room);
+      // A single reveal shows this group's cards for all players (matches the
+      // bot/local flow). Server timeout does the same if nobody taps.
+      revealCurrentGroup(room);
       return;
     }
 
     if (type === "score_group") {
       if (room.phase !== "battle") return socketFail(socket, "Not in battle phase.");
       if (room.battleWinnerIndex == null) return socketFail(socket, "Reveal all cards first.");
-      const winner = room.battleWinnerIndex;
-      room.groupsWon[winner] += 1;
-      room.battleGroupIndex += 1;
-      room.battleRevealCount = 0;
-      room.battleWinnerIndex = null; // Clear for the next group.
-
-      if (room.battleGroupIndex >= (room.groupCount || 3)) {
-        // All groups done — tally round scores.
-        const maxWins = Math.max(...room.groupsWon);
-        const roundWinners = room.groupsWon
-          .map((wins, index) => ({ wins, index }))
-          .filter((entry) => entry.wins === maxWins)
-          .map((entry) => entry.index);
-        const roundWinnerIndex = roundWinners.length === 1 ? roundWinners[0] : null;
-        if (roundWinnerIndex != null) {
-          room.scores[roundWinnerIndex] = (room.scores[roundWinnerIndex] || 0) + 1;
-        }
-        if (room.round >= room.totalRounds) {
-          room.phase = "results";
-        } else {
-          room.round += 1;
-          room.groupsWon = room.players.map(() => 0); // Reset per-round wins.
-          dealRound(room);
-        }
-      }
-
-      broadcastRoom(room);
+      scoreCurrentGroup(room);
     }
     })().catch((error) => {
       socketFail(socket, error instanceof Error ? error.message : "Unexpected server error.");
@@ -1531,6 +1693,26 @@ wss.on("connection", (socket) => {
     if (!meta) return;
     const room = rooms.get(meta.roomId);
     if (!room) return;
+
+    // Matchmaking rooms: seats are fixed for the life of the match. A socket
+    // drop (screen lock, Wi-Fi blip, our own "replaced by newer connection"
+    // eviction) must NOT delete the seat or re-index the table — the player's
+    // hand, groups and score have to survive a reconnect, and the phase
+    // timeouts keep the match moving while they're away. If this was a genuine
+    // reconnect, a newer socket is already bound to the seat, so leave it be.
+    if (isMatchmakingRoomId(room.id)) {
+      if (anySocketBoundToSeat(room.id, meta.playerIndex)) return;
+      const seat = room.players[meta.playerIndex];
+      if (seat) seat.connected = false;
+      if (connectedCount(room.id) === 0) {
+        armRoomAbandon(room);
+      }
+      broadcastRoom(room);
+      return;
+    }
+
+    // Custom lobby rooms (create_room / join_room): original behaviour — remove
+    // the seat and compact the table.
     room.players = room.players.filter((_, index) => index !== meta.playerIndex);
     if (room.players.length === 0) {
       rooms.delete(meta.roomId);
@@ -1543,6 +1725,28 @@ wss.on("connection", (socket) => {
     broadcastRoom(room);
   });
 });
+
+// WebSocket heartbeat: the `ws` server does not detect a peer that vanished
+// without a TCP FIN (exactly what a frozen / Doze'd phone does) — the socket
+// would sit "open" for minutes. Ping every client on an interval and terminate
+// any that missed the previous round-trip, so the close handler above (and its
+// abandon / phase timeouts) run on a predictable ~1 minute worst case.
+function markSocketAlive() {
+  this.isAlive = true;
+}
+
+const heartbeatInterval = setInterval(() => {
+  wss.clients.forEach((socket) => {
+    if (socket.isAlive === false) {
+      try { socket.terminate(); } catch {}
+      return;
+    }
+    socket.isAlive = false;
+    try { socket.ping(); } catch {}
+  });
+}, WS_HEARTBEAT_MS);
+
+wss.on("close", () => clearInterval(heartbeatInterval));
 
 ensureSchema()
   .then(() => {
