@@ -572,16 +572,36 @@ async function buildAuthResponse(user, created) {
 
 async function resolveOrCreateFirebaseUser(decodedToken, providerHint = "firebase") {
   const firebaseUid = decodedToken.uid;
-  const email = String(decodedToken.email || "").trim().toLowerCase();
-  const displayName = String(decodedToken.name || email || "Player").trim();
+  let email = String(decodedToken.email || "").trim().toLowerCase();
   const photoUrl = decodedToken.picture || null;
   const authProvider = normalizeProvider(
     providerHint || decodedToken.firebase?.sign_in_provider || decodedToken.sign_in_provider || "firebase",
   );
 
   if (!email) {
+    // The ID token's own "email" claim only carries an account's top-level
+    // primary email, which Firebase sets only when it considers the linked
+    // provider's email verified. Facebook's Graph response never includes a
+    // verified flag, so this can be blank even though Firebase recorded the
+    // address against the linked Facebook provider. Ask Admin SDK for the
+    // authoritative user record and fall back to that provider-linked email
+    // — never trust a client-supplied email here, since an authenticated
+    // caller could otherwise claim any address and get linked into another
+    // player's account by the email-match lookup below.
+    try {
+      const userRecord = await firebaseAuth.getUser(firebaseUid);
+      const providerEmail = userRecord.providerData.find((p) => p.email)?.email;
+      if (providerEmail) email = String(providerEmail).trim().toLowerCase();
+    } catch (_) {
+      // Falls through to the missing-email error below.
+    }
+  }
+
+  if (!email) {
     throw new Error("Firebase account is missing an email address.");
   }
+
+  const displayName = String(decodedToken.name || email || "Player").trim();
 
   let result = await db.query(`SELECT * FROM users WHERE firebase_uid = $1`, [firebaseUid]);
   if (result.rowCount) {
