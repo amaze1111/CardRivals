@@ -334,6 +334,12 @@ async function ensureSchema() {
   if (!columns.has("password_hash") && columns.has("password")) {
     await db.query(`ALTER TABLE users RENAME COLUMN password TO password_hash`);
   }
+  // Legacy column from an older schema. No insert below writes it, so a NOT NULL
+  // constraint makes every first-time sign-in fail. Relax it and backfill.
+  if (columns.has("username")) {
+    await db.query(`ALTER TABLE users ALTER COLUMN username DROP NOT NULL`);
+    await db.query(`UPDATE users SET username = COALESCE(display_name, email) WHERE username IS NULL`);
+  }
   await db.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS firebase_uid TEXT`);
   await db.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS photo_url TEXT`);
   await db.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS auth_provider TEXT NOT NULL DEFAULT 'email'`);
