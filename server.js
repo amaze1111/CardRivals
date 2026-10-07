@@ -68,6 +68,15 @@ const db = new Pool({
   ssl: DATABASE_URL ? { rejectUnauthorized: false } : false,
 });
 
+// Unqualified table names must keep resolving to public.*. Without this, a DB
+// role named like a schema ("$user" in search_path) makes `users` resolve to
+// card_rivals.users, which has no `id` column.
+db.on("connect", (client) => {
+  client.query("SET search_path TO public").catch((error) =>
+    console.error("Failed to set search_path", error),
+  );
+});
+
 const sessions = new Map();
 const rooms = new Map();
 const clientMeta = new Map();
