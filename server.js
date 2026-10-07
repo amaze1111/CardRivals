@@ -66,15 +66,8 @@ if (!DATABASE_URL) {
 const db = new Pool({
   connectionString: DATABASE_URL,
   ssl: DATABASE_URL ? { rejectUnauthorized: false } : false,
-});
-
-// Unqualified table names must keep resolving to public.*. Without this, a DB
-// role named like a schema ("$user" in search_path) makes `users` resolve to
-// card_rivals.users, which has no `id` column.
-db.on("connect", (client) => {
-  client.query("SET search_path TO public").catch((error) =>
-    console.error("Failed to set search_path", error),
-  );
+  // Every table lives in the card_rivals schema; unqualified names resolve there.
+  options: "-c search_path=card_rivals",
 });
 
 const sessions = new Map();
@@ -301,13 +294,19 @@ function buildDisplayName(user) {
 async function ensureSchema() {
   if (!DATABASE_URL) return;
   await db.query(`CREATE SCHEMA IF NOT EXISTS card_rivals`);
+  // An earlier build created card_rivals.users as a slim analytics table (uuid PK,
+  // no id column). The app's users table now lives here, so park the old one.
   await db.query(`
-    CREATE TABLE IF NOT EXISTS card_rivals.users (
-      uuid UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      user_id TEXT NOT NULL UNIQUE,
-      email TEXT,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )
+    DO $$
+    BEGIN
+      IF to_regclass('card_rivals.users') IS NOT NULL
+         AND NOT EXISTS (
+           SELECT 1 FROM information_schema.columns
+           WHERE table_schema = 'card_rivals' AND table_name = 'users' AND column_name = 'id'
+         ) THEN
+        ALTER TABLE card_rivals.users RENAME TO users_analytics_legacy;
+      END IF;
+    END $$
   `);
   await db.query(`
     CREATE TABLE IF NOT EXISTS card_rivals.events (
@@ -340,13 +339,13 @@ async function ensureSchema() {
   const columnsResult = await db.query(`
     SELECT column_name
     FROM information_schema.columns
-    WHERE table_schema = 'public' AND table_name = 'users'
+    WHERE table_schema = 'card_rivals' AND table_name = 'users'
   `);
   const columns = new Set(columnsResult.rows.map((row) => row.column_name));
   const idTypeResult = await db.query(`
     SELECT data_type, udt_name
     FROM information_schema.columns
-    WHERE table_schema = 'public' AND table_name = 'users' AND column_name = 'id'
+    WHERE table_schema = 'card_rivals' AND table_name = 'users' AND column_name = 'id'
   `);
   const userIdColumnType = idTypeResult.rowCount
     ? (idTypeResult.rows[0].udt_name === "uuid" ? "UUID" : "INTEGER")
@@ -432,6 +431,50 @@ async function ensureSchema() {
       PRIMARY KEY (user_id, quest_key)
     )
   `);
+
+  await migratePublicTables();
+}
+
+// One-time, idempotent copy of rows from the old public.* tables into card_rivals.*.
+// Only runs per table while the card_rivals copy is empty; public.* is left untouched.
+async function migratePublicTables() {
+  const tables = [
+    { name: "users", serial: "id" },
+    { name: "sessions" },
+    { name: "analytics_events", serial: "id" },
+    { name: "economy_transactions", serial: "id" },
+    { name: "user_quests" },
+  ];
+  for (const { name, serial } of tables) {
+    try {
+      const legacy = await db.query(`SELECT to_regclass($1) AS t`, [`public.${name}`]);
+      if (!legacy.rows[0].t) continue;
+      const existing = await db.query(`SELECT 1 FROM card_rivals.${name} LIMIT 1`);
+      if (existing.rowCount) continue;
+      const cols = await db.query(
+        `SELECT n.column_name
+         FROM information_schema.columns n
+         JOIN information_schema.columns o
+           ON o.column_name = n.column_name AND o.table_schema = 'public' AND o.table_name = $1
+         WHERE n.table_schema = 'card_rivals' AND n.table_name = $1`,
+        [name],
+      );
+      if (!cols.rowCount) continue;
+      const list = cols.rows.map((row) => `"${row.column_name}"`).join(", ");
+      const copied = await db.query(
+        `INSERT INTO card_rivals.${name} (${list}) SELECT ${list} FROM public.${name} ON CONFLICT DO NOTHING`,
+      );
+      if (serial) {
+        await db.query(
+          `SELECT setval(pg_get_serial_sequence('card_rivals.${name}', '${serial}'),
+                         COALESCE((SELECT MAX(${serial}) FROM card_rivals.${name}), 1))`,
+        );
+      }
+      console.log(`Migrated ${copied.rowCount} rows from public.${name} to card_rivals.${name}`);
+    } catch (error) {
+      console.error(`Failed to migrate public.${name} into card_rivals`, error);
+    }
+  }
 }
 
 async function updateQuestProgress(userId, eventName, payload = {}) {
@@ -467,20 +510,9 @@ function loginViaLabel(provider) {
   return "Email";
 }
 
-async function upsertCardRivalsUser(userId, email) {
-  if (!DATABASE_URL) return;
-  await db.query(
-    `INSERT INTO card_rivals.users (user_id, email)
-     VALUES ($1, $2)
-     ON CONFLICT (user_id) DO UPDATE SET email = COALESCE(EXCLUDED.email, card_rivals.users.email)`,
-    [String(userId), email || null],
-  );
-}
-
 async function writeAppOpenEvent(session, payload) {
   if (!DATABASE_URL) return;
   const versionCode = Number(payload.appVersionCode);
-  await upsertCardRivalsUser(session.userId, session.email);
   await db.query(
     `INSERT INTO card_rivals.events (event, user_id, app_version_name, app_version_code, login_via)
      VALUES ('app_open', $1, $2, $3, $4)`,
@@ -629,9 +661,6 @@ async function revokeAppSession(token) {
 }
 
 async function buildAuthResponse(user, created) {
-  upsertCardRivalsUser(user.id, user.email).catch((error) =>
-    console.error("Failed to upsert card_rivals user", error),
-  );
   const appToken = await issueAppSession(user);
   const profile = await fetchUserProfile(user.id);
   return {
