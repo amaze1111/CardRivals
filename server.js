@@ -291,6 +291,26 @@ function buildDisplayName(user) {
 
 async function ensureSchema() {
   if (!DATABASE_URL) return;
+  await db.query(`CREATE SCHEMA IF NOT EXISTS card_rivals`);
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS card_rivals.users (
+      uuid UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      user_id TEXT NOT NULL UNIQUE,
+      email TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS card_rivals.events (
+      id BIGSERIAL PRIMARY KEY,
+      event TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      app_version_name TEXT,
+      app_version_code BIGINT,
+      event_timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      login_via TEXT
+    )
+  `);
   await db.query(`
     CREATE TABLE IF NOT EXISTS users (
       id SERIAL PRIMARY KEY,
@@ -431,6 +451,39 @@ async function updateQuestProgress(userId, eventName, payload = {}) {
   }
 }
 
+function loginViaLabel(provider) {
+  const p = String(provider || "").toLowerCase();
+  if (p.includes("google")) return "Google";
+  if (p.includes("facebook")) return "Facebook";
+  return "Email";
+}
+
+async function upsertCardRivalsUser(userId, email) {
+  if (!DATABASE_URL) return;
+  await db.query(
+    `INSERT INTO card_rivals.users (user_id, email)
+     VALUES ($1, $2)
+     ON CONFLICT (user_id) DO UPDATE SET email = COALESCE(EXCLUDED.email, card_rivals.users.email)`,
+    [String(userId), email || null],
+  );
+}
+
+async function writeAppOpenEvent(session, payload) {
+  if (!DATABASE_URL) return;
+  const versionCode = Number(payload.appVersionCode);
+  await upsertCardRivalsUser(session.userId, session.email);
+  await db.query(
+    `INSERT INTO card_rivals.events (event, user_id, app_version_name, app_version_code, login_via)
+     VALUES ('app_open', $1, $2, $3, $4)`,
+    [
+      String(session.userId),
+      payload.appVersionName ? String(payload.appVersionName) : null,
+      Number.isFinite(versionCode) ? versionCode : null,
+      loginViaLabel(session.authProvider),
+    ],
+  );
+}
+
 async function writeAnalyticsEvent({ userId = null, eventName, source, matchId = null, payload = {} }) {
   if (!DATABASE_URL) return;
   await db.query(
@@ -567,6 +620,9 @@ async function revokeAppSession(token) {
 }
 
 async function buildAuthResponse(user, created) {
+  upsertCardRivalsUser(user.id, user.email).catch((error) =>
+    console.error("Failed to upsert card_rivals user", error),
+  );
   const appToken = await issueAppSession(user);
   const profile = await fetchUserProfile(user.id);
   return {
@@ -812,6 +868,13 @@ async function handleTrackEvent(req, res) {
   if (!eventName) {
     fail(res, 400, "eventName is required.");
     return;
+  }
+  if (eventName === "app_open") {
+    try {
+      await writeAppOpenEvent(session, payload);
+    } catch (error) {
+      console.error("Failed to write app_open event", error);
+    }
   }
   await writeAnalyticsEvent({
     userId: session.userId,
