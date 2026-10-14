@@ -26,6 +26,7 @@ const STARTING_COINS = Number(process.env.STARTING_COINS || 500);
 const DAILY_COIN_REWARD = Number(process.env.DAILY_COIN_REWARD || 75);
 const MATCH_ENTRY_FEES = {
   2: Number(process.env.MATCH_ENTRY_FEE_2P || 1),
+  3: Number(process.env.MATCH_ENTRY_FEE_3P || 20),
   4: Number(process.env.MATCH_ENTRY_FEE_4P || 40),
 };
 
@@ -97,7 +98,9 @@ function ensureMatchRoom(matchId) {
     id: normalized,
     phase: "lobby",
     round: 1,
-    totalRounds: 3,
+    totalRounds: cfg.totalRounds,
+    targetScore: cfg.targetScore,
+    arrangeMs: cfg.arrangeMs,
     mode: status.mode || "ten",
     groupCount: cfg.groupCount,
     cardsPerHand: cfg.cardsPerHand,
@@ -951,8 +954,9 @@ async function handleMatchmakingJoin(req, res) {
   const session = await requireAuth(req, res);
   if (!session) return;
   const body = await parseBody(req);
-  const playerCount = Number(body.playerCount || 0);
-  const mode = body.mode === "fifteen" ? "fifteen" : "ten";
+  const mode = body.mode === "fast5" ? "fast5" : body.mode === "thirteen" ? "thirteen" : "ten";
+  // Fast 5 is a 2-player format whatever the client asked for.
+  const playerCount = mode === "fast5" ? 2 : Number(body.playerCount || 0);
   const entryFee = MATCH_ENTRY_FEES[playerCount];
   if (!entryFee) {
     fail(res, 400, "Unsupported player count.");
@@ -1232,12 +1236,25 @@ function id() {
   return Math.random().toString(36).slice(2, 8).toUpperCase();
 }
 
-// "ten" is the original 10-card / 3-group game. "fifteen" is the Big Hand
-// variant: 15 cards, 5 groups of 3, no discard.
+// "ten" is the 2-player game: 10 cards, 3 groups of 3, one card discarded.
+// "thirteen" is the 3-player game: 13 cards, 4 groups of 3, one card discarded.
+// "fast5" is the 2-player quick format: 7 cards, play the best 3 and discard 1,
+// showdown as soon as both are done, 30 s to arrange, first to 5 points wins
+// (at most 9 rounds). The 3 cards you did not use stay in your hand.
 function modeConfig(mode) {
-  return mode === "fifteen"
-    ? { cardsPerHand: 15, groupCount: 5, hasDiscard: false }
-    : { cardsPerHand: 10, groupCount: 3, hasDiscard: true };
+  if (mode === "fast5") {
+    return {
+      cardsPerHand: 7,
+      groupCount: 1,
+      hasDiscard: true,
+      totalRounds: 9,
+      targetScore: 5,
+      arrangeMs: 35000, // client timer is 30 s; +5 s so the client's auto_ready wins
+    };
+  }
+  return mode === "thirteen"
+    ? { cardsPerHand: 13, groupCount: 4, hasDiscard: true, totalRounds: 3, targetScore: null, arrangeMs: ARRANGE_TIMEOUT_MS }
+    : { cardsPerHand: 10, groupCount: 3, hasDiscard: true, totalRounds: 3, targetScore: null, arrangeMs: ARRANGE_TIMEOUT_MS };
 }
 
 function emptyGroups(count) {
@@ -1254,7 +1271,7 @@ function buildDeck(deckCount = 1) {
           rank,
           value,
           suit,
-          // Suffix the id only when a second deck is in play (15-card 4-player),
+          // Suffix the id only when a second deck is in play (a mode needing >52 cards),
           // so the two identical cards stay distinct on the client.
           id: copies > 1 ? `${rank}${suit}#${copy}` : `${rank}${suit}`,
           copyIndex: copy,
@@ -1308,15 +1325,23 @@ function dealRound(room) {
   const cardsPerHand = room.cardsPerHand || 10;
   const needed = cardsPerHand * room.players.length;
   const deckCount = Math.max(1, Math.ceil(needed / 52));
-  const deck = buildDeck(deckCount);
+  // Fast 5 keeps the cards a player did not use: only the emptied slots refill.
+  const carried = room.players.map((p) => (room.mode === "fast5" && room.round > 1 ? p.carry || [] : []));
+  const taken = new Set(carried.flat().map((c) => c.id));
+  const deck = buildDeck(deckCount).filter((c) => !taken.has(c.id));
   room.players = room.players.map((player, index) => ({
     ...player,
     id: index,
-    hand: deck.splice(0, cardsPerHand),
+    hand: carried[index].concat(deck.splice(0, Math.max(0, cardsPerHand - carried[index].length))),
+    carry: [],
     groups: emptyGroups(groupCount),
     discarded: null,
     ready: false,
+    // One refresh per player per game: carried across rounds, reset on round 1.
+    refreshUsed: room.round > 1 ? Boolean(player.refreshUsed) : false,
   }));
+  // Undealt cards: the pool refresh_hand draws from (alongside the player's own).
+  room.deck = deck;
   room.phase = "arrange";
   room.activeArrangePlayerIndex = 0;
   room.battleGroupIndex = 0;
@@ -1356,11 +1381,60 @@ function evaluateGroup(cards) {
   return { type: "high", score: desc[0] * 10000 + desc[1] * 100 + desc[2], strength: 1 };
 }
 
+// Spade > Heart > Diamond > Club (SUITS is already in that order).
+function suitPower(card) {
+  return 4 - SUITS.indexOf(card.suit);
+}
+
+function compareSuitLists(a, b) {
+  for (let i = 0; i < Math.min(a.length, b.length); i += 1) {
+    if (a[i] !== b[i]) return a[i] - b[i];
+  }
+  return 0;
+}
+
+// Suit tie-break for two groups of the same type and rank score:
+//  - toak / pure: strongest suit first
+//  - impure sequence: suit of the highest card, then the next, then the next
+//  - pair: the pair's suits (strongest first), then the odd card's suit
+//  - flush / high: suit of the highest card, then the next, then the last
+function suitTieBreak(a, b, type) {
+  const desc = (cards) => cards.map(suitPower).sort((x, y) => y - x);
+  if (type === "toak" || type === "pure") return compareSuitLists(desc(a), desc(b));
+  if (type === "impure") {
+    const bySequence = (cards) => {
+      const lowAce = cards.map((c) => c.value).sort((x, y) => x - y).join() === "2,3,14";
+      const key = (c) => (lowAce && c.value === 14 ? 1 : c.value);
+      return cards.slice().sort((x, y) => key(y) - key(x)).map(suitPower);
+    };
+    return compareSuitLists(bySequence(a), bySequence(b));
+  }
+  if (type === "flush" || type === "high") {
+    const byRank = (cards) => cards.slice().sort((x, y) => y.value - x.value).map(suitPower);
+    return compareSuitLists(byRank(a), byRank(b));
+  }
+  if (type === "pair") {
+    const pairSuits = (cards) => {
+      const counts = {};
+      cards.forEach((c) => {
+        counts[c.value] = (counts[c.value] || 0) + 1;
+      });
+      const pairValue = Number(Object.keys(counts).find((key) => counts[key] === 2));
+      const pair = cards.filter((c) => c.value === pairValue).map(suitPower).sort((x, y) => y - x);
+      return pair.concat(cards.filter((c) => c.value !== pairValue).map(suitPower));
+    };
+    return compareSuitLists(pairSuits(a), pairSuits(b));
+  }
+  return 0;
+}
+
 function compareGroups(a, b) {
   const left = evaluateGroup(a);
   const right = evaluateGroup(b);
   if (left.strength !== right.strength) return left.strength - right.strength;
-  return left.score - right.score;
+  if (left.score !== right.score) return left.score - right.score;
+  if (a.length !== 3 || b.length !== 3) return 0;
+  return suitTieBreak(a, b, left.type);
 }
 
 function resolveBattle(room) {
@@ -1390,6 +1464,7 @@ function sanitizeRoomState(room, playerIndex) {
     phase: room.phase,
     round: room.round,
     totalRounds: room.totalRounds,
+    targetScore: room.targetScore || null,
     mode: room.mode || "ten",
     groupCount,
     localPlayerIndex: playerIndex,
@@ -1405,6 +1480,7 @@ function sanitizeRoomState(room, playerIndex) {
       id: player.id,
       name: player.name,
       ready: player.ready,
+      refreshUsed: Boolean(player.refreshUsed),
       discarded: index === playerIndex ? player.discarded : null,
       hand: index === playerIndex ? player.hand : [],
       groups: index === playerIndex || room.phase === "battle" || room.phase === "results"
@@ -1452,6 +1528,29 @@ function clearAllRoomTimers(room) {
 // Auto-arrange one player's hand and mark them ready. Mirrors the "auto_ready"
 // message handler (same simple sort-and-chunk the client uses on timeout).
 function autoArrangePlayer(room, player) {
+  if (room.mode === "fast5") {
+    // Best 3 of the 7, discard the weakest of the rest, keep the other 3.
+    const cards = [...player.hand, ...player.groups.flat()];
+    if (player.discarded) cards.push(player.discarded);
+    let best = null;
+    for (let i = 0; i < cards.length; i += 1) {
+      for (let j = i + 1; j < cards.length; j += 1) {
+        for (let k = j + 1; k < cards.length; k += 1) {
+          const group = [cards[i], cards[j], cards[k]];
+          if (!best || compareGroups(group, best) > 0) best = group;
+        }
+      }
+    }
+    if (best) {
+      const rest = cards.filter((c) => !best.includes(c)).sort((a, b) => a.value - b.value);
+      player.groups = [best];
+      player.discarded = rest[0] || null;
+      player.carry = rest.slice(1);
+      player.hand = [];
+      player.ready = true;
+      return;
+    }
+  }
   const groupCount = room.groupCount || 3;
   const needDiscard = room.hasDiscard !== false;
   const allCards = [...player.hand, ...player.groups.flat()];
@@ -1490,7 +1589,7 @@ function scheduleArrangeTimeout(room) {
       enterBattle(room);
     }
     if (changed) broadcastRoom(room);
-  }, ARRANGE_TIMEOUT_MS);
+  }, room.arrangeMs || ARRANGE_TIMEOUT_MS);
 }
 
 function scheduleBattleTimeout(room) {
@@ -1533,7 +1632,8 @@ function scoreCurrentGroup(room) {
     if (roundWinnerIndex != null) {
       room.scores[roundWinnerIndex] = (room.scores[roundWinnerIndex] || 0) + 1;
     }
-    if (room.round >= room.totalRounds) {
+    const reachedTarget = Boolean(room.targetScore) && Math.max(...room.scores) >= room.targetScore;
+    if (room.round >= room.totalRounds || reachedTarget) {
       room.phase = "results";
       clearRoomTimer(room, "battle");
       clearRoomTimer(room, "arrange");
@@ -1712,6 +1812,28 @@ wss.on("connection", (socket) => {
       return;
     }
 
+    if (type === "refresh_hand") {
+      if (room.mode === "fast5") return socketFail(socket, "Refresh is not available in Fast 5.");
+      if (room.phase !== "arrange") return socketFail(socket, "Not in arrange phase.");
+      if (player.ready) return socketFail(socket, "You are already ready.");
+      if (player.refreshUsed) return socketFail(socket, "Refresh already used - once per game.");
+      const cardsPerHand = room.cardsPerHand || 10;
+      // Pool = undealt cards + every card this player currently holds.
+      const pool = [...(room.deck || []), ...player.hand, ...player.groups.flat()];
+      if (player.discarded) pool.push(player.discarded);
+      for (let i = pool.length - 1; i > 0; i -= 1) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [pool[i], pool[j]] = [pool[j], pool[i]];
+      }
+      player.hand = pool.splice(0, cardsPerHand);
+      player.groups = emptyGroups(room.groupCount || 3);
+      player.discarded = null;
+      player.refreshUsed = true;
+      room.deck = pool;
+      broadcastRoom(room);
+      return;
+    }
+
     if (type === "discard_card") {
       if (room.phase !== "arrange") return socketFail(socket, "Not in arrange phase.");
       if (room.hasDiscard === false) return socketFail(socket, "This mode has no discard.");
@@ -1737,6 +1859,19 @@ wss.on("connection", (socket) => {
       const { groups: groupsPayload, discarded: discardedPayload } = payload;
       const groupCount = room.groupCount || 3;
       const needDiscard = room.hasDiscard !== false;
+      // Fast 5 carries the unused cards into the next round, so remember what
+      // this player was actually dealt and refuse cards they were not dealt.
+      const dealtCards = [...player.hand];
+      if (room.mode === "fast5" && Array.isArray(groupsPayload)) {
+        const dealtIds = new Set(dealtCards.map((c) => c.id));
+        const sent = [...groupsPayload.flat(), discardedPayload].filter(Boolean);
+        if (
+          sent.some((c) => !dealtIds.has(c.id)) ||
+          new Set(sent.map((c) => c.id)).size !== sent.length
+        ) {
+          return socketFail(socket, "Invalid arrangement: cards do not match your hand.");
+        }
+      }
 
       if (Array.isArray(groupsPayload)) {
         // Validate: groupCount groups of 3 cards each, plus a discard for "ten".
@@ -1762,8 +1897,12 @@ wss.on("connection", (socket) => {
         }
       }
 
-      // Sort groups strongest-first (mirrors what the client does).
-      player.groups = player.groups.slice().sort((a, b) => compareGroups(b, a));
+      if (room.mode === "fast5") {
+        const usedIds = new Set([...player.groups.flat(), player.discarded].filter(Boolean).map((c) => c.id));
+        player.carry = dealtCards.filter((c) => !usedIds.has(c.id));
+      }
+
+      // Groups keep the order the player built them in (no auto-ordering).
       player.ready = true;
 
       // Broadcast immediately so all clients see this player is ready.

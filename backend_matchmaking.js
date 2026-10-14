@@ -22,11 +22,11 @@ export function createMatchmakingManager({
   const matches = new Map(); // matchId -> { playerCount, mode, players, createdAtMs }
 
   function normalizeMode(mode) {
-    return mode === "fifteen" ? "fifteen" : "ten";
+    return mode === "fast5" ? "fast5" : mode === "thirteen" ? "thirteen" : "ten";
   }
 
   function queueFor(playerCount, mode) {
-    // 15-card and 10-card players must never land in the same match, so the
+    // Players of different formats must never land in the same match, so the
     // mode is part of the queue key.
     const key = `${playerCount}:${normalizeMode(mode)}`;
     let queue = queues.get(key);
