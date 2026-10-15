@@ -1261,22 +1261,12 @@ function emptyGroups(count) {
   return Array.from({ length: count }, () => []);
 }
 
-function buildDeck(deckCount = 1) {
-  const copies = Math.max(1, deckCount);
+// One standard 52-card deck, shuffled. Every format plays from a single deck.
+function buildDeck() {
   const deck = [];
-  for (let copy = 0; copy < copies; copy += 1) {
-    for (const suit of SUITS) {
-      for (const [rank, value] of RANKS) {
-        deck.push({
-          rank,
-          value,
-          suit,
-          // Suffix the id only when a second deck is in play (a mode needing >52 cards),
-          // so the two identical cards stay distinct on the client.
-          id: copies > 1 ? `${rank}${suit}#${copy}` : `${rank}${suit}`,
-          copyIndex: copy,
-        });
-      }
+  for (const suit of SUITS) {
+    for (const [rank, value] of RANKS) {
+      deck.push({ rank, value, suit, id: `${rank}${suit}`, copyIndex: 0 });
     }
   }
   for (let i = deck.length - 1; i > 0; i -= 1) {
@@ -1323,12 +1313,10 @@ function createRoom(hostName) {
 function dealRound(room) {
   const groupCount = room.groupCount || 3;
   const cardsPerHand = room.cardsPerHand || 10;
-  const needed = cardsPerHand * room.players.length;
-  const deckCount = Math.max(1, Math.ceil(needed / 52));
   // Fast 5 keeps the cards a player did not use: only the emptied slots refill.
   const carried = room.players.map((p) => (room.mode === "fast5" && room.round > 1 ? p.carry || [] : []));
   const taken = new Set(carried.flat().map((c) => c.id));
-  const deck = buildDeck(deckCount).filter((c) => !taken.has(c.id));
+  const deck = buildDeck().filter((c) => !taken.has(c.id));
   room.players = room.players.map((player, index) => ({
     ...player,
     id: index,
