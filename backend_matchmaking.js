@@ -4,6 +4,20 @@ function defaultCreateMatchId() {
   return `M-${crypto.randomBytes(4).toString("hex").toUpperCase()}`;
 }
 
+const BOT_NAMES = [
+  "Aarav", "Vihaan", "Diya", "Kabir", "Meera", "Rohan", "Ishaan", "Anaya",
+  "Arjun", "Saanvi", "Reyansh", "Kiara", "Dev", "Tara", "Neil", "Zara",
+];
+
+function pickBotNames(count, taken) {
+  const pool = BOT_NAMES.filter((name) => !taken.has(name));
+  for (let i = pool.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [pool[i], pool[j]] = [pool[j], pool[i]];
+  }
+  return Array.from({ length: Math.max(0, count) }, (_, i) => pool[i] ?? `Player ${i + 2}`);
+}
+
 function once(fn) {
   let called = false;
   return (...args) => {
@@ -207,6 +221,39 @@ export function createMatchmakingManager({
 
       pending.timeoutId = setTimeout(() => {
         remove(queue, pending);
+
+        // Others queued for the same table (3P / 4P short of a full house): seat
+        // them together and fill the rest with shared bots, instead of each
+        // player getting a private bot-only table.
+        if (queue.length > 0) {
+          const group = [pending, ...queue.splice(0, queue.length)];
+          group.slice(1).forEach((other) => clearTimeout(other.timeoutId));
+          const matchId = createMatchId();
+          const humans = group.map((p) => ({ userId: p.userId, displayName: p.displayName }));
+          const taken = new Set(humans.map((p) => p.displayName));
+          const bots = pickBotNames(playerCount - humans.length, taken).map((displayName) => ({
+            userId: null,
+            displayName,
+            isBot: true,
+          }));
+          const matchPlayers = [...humans, ...bots];
+          upsertMatch(matchId, playerCount, matchPlayers, matchMode);
+          respondGroup(group, (p) => ({
+            matchId,
+            playerCount,
+            mode: matchMode,
+            entryFee,
+            rewardPool,
+            coinBalance: p.coinBalance,
+            isRanked,
+            botFillApplied: false,
+            opponentDisplayNames: matchPlayers
+              .filter((m) => m.userId !== p.userId)
+              .map((m) => m.displayName),
+          }));
+          return;
+        }
+
         const matchId = createMatchId();
         upsertMatch(matchId, playerCount, [{ userId, displayName }], matchMode);
         const payload = {

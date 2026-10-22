@@ -117,7 +117,10 @@ function ensureMatchRoom(matchId) {
       // `connected` tracks live socket presence for the abandon grace timer.
       ...createPlayer(p.displayName || `Player ${index + 1}`, index, cfg.groupCount),
       userId: p.userId,
-      connected: false,
+      // Bot seats (a 3P/4P table that filled short) have no socket; they are
+      // always "connected" and auto-arrange themselves in dealRound().
+      isBot: Boolean(p.isBot),
+      connected: Boolean(p.isBot),
     })),
     // Per-room timer handles (arrange auto-advance, battle step auto-advance,
     // abandon grace). Never serialised to clients — sanitizeRoomState rebuilds
@@ -163,7 +166,8 @@ function attachSocketToMatchRoom({ socket, matchId, userId }) {
   broadcastRoom(room);
 
   // Auto-start once all players are connected.
-  if (room.phase === "lobby" && connectedCount(room.id) >= status.players.length) {
+  const humanSeats = status.players.filter((p) => !p.isBot).length;
+  if (room.phase === "lobby" && connectedCount(room.id) >= humanSeats) {
     room.scores = room.players.map(() => 0);
     room.groupsWon = room.players.map(() => 0);
     room.round = 1;
@@ -1330,6 +1334,10 @@ function dealRound(room) {
   }));
   // Undealt cards: the pool refresh_hand draws from (alongside the player's own).
   room.deck = deck;
+  // Bot seats arrange immediately so the table never waits on them.
+  room.players.forEach((player) => {
+    if (player.isBot) autoArrangePlayer(room, player);
+  });
   room.phase = "arrange";
   room.activeArrangePlayerIndex = 0;
   room.battleGroupIndex = 0;
@@ -1594,6 +1602,8 @@ function scheduleBattleTimeout(room) {
 // Same effect as any player sending "reveal_next".
 function revealCurrentGroup(room) {
   if (room.phase !== "battle") return;
+  // Every client auto-sends reveal_next; the first one wins, the rest are no-ops.
+  if (room.battleWinnerIndex != null) return;
   room.battleRevealCount = room.players.length;
   room.battleWinnerIndex = resolveBattle(room);
   broadcastRoom(room);
