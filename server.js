@@ -159,8 +159,18 @@ function attachSocketToMatchRoom({ socket, matchId, userId }) {
     }
   });
 
+  // Leaving is final: a player who left on purpose cannot take the seat back.
+  if (room.players[playerIndex] && room.players[playerIndex].left) {
+    socketFail(socket, "You left this match.");
+    return;
+  }
+
   clientMeta.set(socket, { roomId: room.id, playerIndex, userId });
-  if (room.players[playerIndex]) room.players[playerIndex].connected = true;
+  if (room.players[playerIndex]) {
+    room.players[playerIndex].connected = true;
+    room.players[playerIndex].dropped = false;
+  }
+  clearDropTimer(room, playerIndex);
   clearRoomTimer(room, "abandon");
   send(socket, "match_joined", { roomId: room.id, playerIndex, matchId: room.id });
   broadcastRoom(room);
@@ -1335,8 +1345,9 @@ function dealRound(room) {
   // Undealt cards: the pool refresh_hand draws from (alongside the player's own).
   room.deck = deck;
   // Bot seats arrange immediately so the table never waits on them.
+  // Players who left or dropped for good are played out the same way.
   room.players.forEach((player) => {
-    if (player.isBot) autoArrangePlayer(room, player);
+    if (player.isBot || player.left || player.dropped) autoArrangePlayer(room, player);
   });
   room.phase = "arrange";
   room.activeArrangePlayerIndex = 0;
@@ -1434,7 +1445,11 @@ function compareGroups(a, b) {
 }
 
 function resolveBattle(room) {
-  const showOrder = room.players.map((_, index) => (index + 1) % room.players.length);
+  // Players who left or dropped for good no longer compete.
+  const showOrder = room.players
+    .map((_, index) => (index + 1) % room.players.length)
+    .filter((index) => !room.players[index].left && !room.players[index].dropped);
+  if (showOrder.length === 0) return 0;
   let winner = showOrder[0];
   for (const challenger of showOrder.slice(1)) {
     const compareResult = compareGroups(
@@ -1472,6 +1487,9 @@ function sanitizeRoomState(room, playerIndex) {
     battleWinnerIndex: room.battleWinnerIndex ?? null,
     scores: room.scores,
     groupsWon: room.groupsWon,
+    // Set when the match ended early because too many humans left.
+    endReason: room.endReason || null,
+    forfeitWinnerIndex: room.forfeitWinnerIndex ?? null,
     players: room.players.map((player, index) => ({
       id: player.id,
       name: player.name,
@@ -1479,9 +1497,13 @@ function sanitizeRoomState(room, playerIndex) {
       refreshUsed: Boolean(player.refreshUsed),
       discarded: index === playerIndex ? player.discarded : null,
       hand: index === playerIndex ? player.hand : [],
-      groups: index === playerIndex || room.phase === "battle" || room.phase === "results"
-        ? player.groups
-        : emptyGroups(groupCount),
+      // An away player's cards are never shown: the others see backs only.
+      away: Boolean(player.left || player.dropped),
+      groups: index !== playerIndex && (player.left || player.dropped)
+        ? emptyGroups(groupCount)
+        : index === playerIndex || room.phase === "battle" || room.phase === "results"
+          ? player.groups
+          : emptyGroups(groupCount),
     })),
   };
 }
@@ -1519,6 +1541,63 @@ function clearAllRoomTimers(room) {
   clearRoomTimer(room, "arrange");
   clearRoomTimer(room, "battle");
   clearRoomTimer(room, "abandon");
+  if (room && room.dropTimers) {
+    Object.values(room.dropTimers).forEach((handle) => clearTimeout(handle));
+    room.dropTimers = {};
+  }
+}
+
+// A dropped socket gets this long to come back before the seat counts as gone.
+const DISCONNECT_FORFEIT_MS = Number(process.env.DISCONNECT_FORFEIT_MS || 20000);
+
+function clearDropTimer(room, playerIndex) {
+  if (room.dropTimers && room.dropTimers[playerIndex]) {
+    clearTimeout(room.dropTimers[playerIndex]);
+    delete room.dropTimers[playerIndex];
+  }
+}
+
+// A human seat that left (explicit, permanent) or stayed disconnected past the
+// grace window. Called whenever one of those happens.
+//
+// - 2 humans at the start: one leaves -> the other wins.
+// - 3 humans at the start: one leaves -> play on; a second leaves -> last one wins.
+// Both reduce to "the match ends when at most one human is still in".
+function evaluateAbandonment(room) {
+  if (!rooms.has(room.id) || room.phase === "lobby" || room.phase === "results") return;
+  const humans = room.players.filter((p) => !p.isBot);
+  if (humans.length < 2) return;
+  const active = humans.filter((p) => !p.left && !p.dropped);
+  if (active.length === 0) return;
+  if (active.length === 1) {
+    const winnerIndex = room.players.indexOf(active[0]);
+    clearAllRoomTimers(room);
+    // Make sure the standings agree with the forfeit for settlement and display.
+    const best = Math.max(...room.scores);
+    if ((room.scores[winnerIndex] || 0) <= best) room.scores[winnerIndex] = best + 1;
+    room.endReason = "opponent_left";
+    room.forfeitWinnerIndex = winnerIndex;
+    room.phase = "results";
+    broadcastRoom(room);
+    return;
+  }
+  // The match goes on without them: play their seat out so nobody waits.
+  if (room.phase === "arrange") {
+    room.players.forEach((p) => {
+      if ((p.left || p.dropped) && !p.ready) autoArrangePlayer(room, p);
+    });
+    if (room.players.every((p) => p.ready)) enterBattle(room);
+  }
+  broadcastRoom(room);
+}
+
+function markSeatLeft(room, playerIndex) {
+  const seat = room.players[playerIndex];
+  if (!seat || seat.isBot) return;
+  seat.left = true;
+  seat.connected = false;
+  clearDropTimer(room, playerIndex);
+  evaluateAbandonment(room);
 }
 
 // Auto-arrange one player's hand and mark them ready. Mirrors the "auto_ready"
@@ -1784,6 +1863,15 @@ wss.on("connection", (socket) => {
     if (!player) return;
     const meta = clientMeta.get(socket);
 
+    if (type === "leave_match") {
+      if (!isMatchmakingRoomId(room.id)) return;
+      markSeatLeft(room, meta.playerIndex);
+      // The seat is gone: stop routing this socket's room traffic.
+      clientMeta.delete(socket);
+      if (rooms.has(room.id) && connectedCount(room.id) === 0) armRoomAbandon(room);
+      return;
+    }
+
     if (type === "start_game") {
       if (meta.playerIndex !== 0) return socketFail(socket, "Only the host can start the game.");
       if (room.players.length < 2) return socketFail(socket, "Need at least 2 players.");
@@ -1970,6 +2058,19 @@ wss.on("connection", (socket) => {
       if (seat) seat.connected = false;
       if (connectedCount(room.id) === 0) {
         armRoomAbandon(room);
+      }
+      // A seat that stays away past the grace window counts as having left.
+      if (seat && !seat.left && !seat.isBot) {
+        const seatIndex = meta.playerIndex;
+        clearDropTimer(room, seatIndex);
+        if (!room.dropTimers) room.dropTimers = {};
+        room.dropTimers[seatIndex] = setTimeout(() => {
+          delete room.dropTimers[seatIndex];
+          const current = room.players[seatIndex];
+          if (!rooms.has(room.id) || !current || current.connected) return;
+          current.dropped = true;
+          evaluateAbandonment(room);
+        }, DISCONNECT_FORFEIT_MS);
       }
       broadcastRoom(room);
       return;
